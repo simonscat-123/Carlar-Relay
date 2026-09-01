@@ -68,6 +68,7 @@ def _run_exp10(args):
 
     created_sids = []
     vehicle = None
+    _plan_log_f = None    # 规划调试日志文件句柄（主循环前打开，finally 关闭）
     _exp10_old_settings = None
 
     try:
@@ -282,12 +283,177 @@ def _run_exp10(args):
             path = grp.trace_route(start_loc, end_loc)
             route_wp = [wp.transform.location for wp, _ in path]
             route_lane_ids = [(wp.road_id, wp.lane_id) for wp, _ in path]
+            route_wps = [wp for wp, _ in path]   # 保留 waypoint 对象（车道/邻道查询用）
             _exp_log(f"路线规划完成: {len(route_wp)} waypoints")
         except Exception as exc:
             _exp_log(f"路线规划失败({exc})，使用直线插值")
             route_wp = [start_loc, end_loc]
+            route_wps = []
         route_lane_ids += [None] * (len(route_wp) - len(route_lane_ids))
+        route_wps += [None] * (len(route_wp) - len(route_wps))
         _EXP10_ROUTE = list(route_wp)
+
+        # ── 参考线层：弧长表 + Frenet 变换 + 可行驶域（时空联合规划的基础设施）──
+        # s_tab: 与 route_wp 平行的累计弧长；参考线本身即车道中心线（GRP 沿车道中心采样）
+        s_tab = [0.0]
+        for _j in range(1, len(route_wp)):
+            s_tab.append(s_tab[-1] + route_wp[_j].distance(route_wp[_j - 1]))
+
+        def _frenet(px, py, j0=0, j1=None):
+            """世界坐标 → Frenet (s, l, 切向tx, 切向ty)。
+            在 [j0, j1) 路点窗口内找最近路点，s = 弧长 + 切向投影，
+            l = 相对切线的横向偏移（左正，与控制层约定一致）。"""
+            if j1 is None:
+                j1 = len(route_wp)
+            best_j, best_d2 = j0, float("inf")
+            for j in range(j0, j1):
+                d2 = (px - route_wp[j].x) ** 2 + (py - route_wp[j].y) ** 2
+                if d2 < best_d2:
+                    best_d2, best_j = d2, j
+            a = route_wp[max(0, best_j - 1)]
+            b = route_wp[min(len(route_wp) - 1, best_j + 1)]
+            tx, ty = b.x - a.x, b.y - a.y
+            tl = math.hypot(tx, ty)
+            if tl < 1e-6:
+                tx, ty = 1.0, 0.0
+            else:
+                tx, ty = tx / tl, ty / tl
+            rx, ry = px - route_wp[best_j].x, py - route_wp[best_j].y
+            return (s_tab[best_j] + tx * rx + ty * ry,
+                    tx * ry - ty * rx, tx, ty)
+
+        def _world(s, l):
+            """Frenet (s, l) → 世界坐标 (x, y)。s 超出路线范围时钳到端点。"""
+            s = max(0.0, min(s, s_tab[-1]))
+            lo, hi = 0, len(s_tab) - 1
+            while hi - lo > 1:
+                mid = (lo + hi) // 2
+                if s_tab[mid] <= s:
+                    lo = mid
+                else:
+                    hi = mid
+            nxt = min(lo + 1, len(route_wp) - 1)
+            a, b = route_wp[lo], route_wp[nxt]
+            seg = s_tab[nxt] - s_tab[lo]
+            u = 0.0 if seg < 1e-6 else max(0.0, min(1.0, (s - s_tab[lo]) / seg))
+            px, py = a.x + (b.x - a.x) * u, a.y + (b.y - a.y) * u
+            tx, ty = b.x - a.x, b.y - a.y
+            tl = math.hypot(tx, ty)
+            if tl < 1e-6:
+                tx, ty = 1.0, 0.0
+            else:
+                tx, ty = tx / tl, ty / tl
+            return px - ty * l, py + tx * l   # 左法向 (-ty, tx) × l
+
+        # 可行驶域：从路线当前车道向两侧扩展「同向 Driving」车道，得到相对参考线的
+        # 横向边界 (l_min, l_max)——对向车道/路缘即边界，逆行轨迹从此无法通过硬约束。
+        _bounds_cache = {}
+
+        def _drivable_bounds(j):
+            """route_wp[j] 所在车道的可行驶横向边界（相对该处参考线）。失败返回 None。"""
+            key = route_lane_ids[j] if j < len(route_lane_ids) else None
+            if key is None:
+                return None
+            if key in _bounds_cache:
+                return _bounds_cache[key]
+            wp = route_wps[j]
+            l_min = l_max = None
+            try:
+                if wp is not None:
+                    w0 = wp.lane_width
+                    edge_l, edge_r = -w0 / 2.0, w0 / 2.0
+                    cur = wp
+                    # 向左扩展：仅接受 Driving 且前向同向的车道
+                    for _ in range(3):
+                        nb = cur.get_left_lane()
+                        if nb is None or nb.lane_type != carla.LaneType.Driving:
+                            break
+                        nf = nb.transform.get_forward_vector()
+                        cf = cur.transform.get_forward_vector()
+                        if nf.x * cf.x + nf.y * cf.y <= 0.0:
+                            break   # 对向车道，禁入
+                        edge_l -= nb.lane_width
+                        cur = nb
+                    cur = wp
+                    for _ in range(3):
+                        nb = cur.get_right_lane()
+                        if nb is None or nb.lane_type != carla.LaneType.Driving:
+                            break
+                        nf = nb.transform.get_forward_vector()
+                        cf = cur.transform.get_forward_vector()
+                        if nf.x * cf.x + nf.y * cf.y <= 0.0:
+                            break
+                        edge_r += nb.lane_width
+                        cur = nb
+                    l_min, l_max = edge_l, edge_r
+            except Exception:
+                pass
+            _bounds_cache[key] = (l_min, l_max)
+            return l_min, l_max
+
+        def _bounds_at_s(s):
+            """弧长 s 处的可行驶域边界（换道轨迹跨多车道段时逐点取当地边界，
+            而非只用车头处的边界——前方车道收窄/对向开始处才不会误入）。"""
+            lo, hi = 0, len(s_tab) - 1
+            while hi - lo > 1:
+                mid = (lo + hi) // 2
+                if s_tab[mid] <= s:
+                    lo = mid
+                else:
+                    hi = mid
+            b = _drivable_bounds(lo)
+            if b is not None and b[0] is not None:
+                return b
+            return None
+
+        def _lat_lane_ok(l_t, s_probe):
+            """横向偏移 l_t 在弧长 s_probe 处是否落在「同向 Driving 车道」。
+            直接取该偏移点的地图车道做前向点积校验——不依赖边界缓存的推断，
+            对向车道（含斜向/路口交叉车道，点积≤0.3）一律判不可行。"""
+            try:
+                px, py = _world(s_probe, l_t)
+                wp2 = carla_map.get_waypoint(
+                    carla.Location(x=px, y=py, z=0.0),
+                    project_to_road=True, lane_type=carla.LaneType.Driving)
+                if wp2 is None:
+                    return False
+                lo, hi = 0, len(s_tab) - 1
+                while hi - lo > 1:
+                    mid = (lo + hi) // 2
+                    if s_tab[mid] <= s_probe:
+                        lo = mid
+                    else:
+                        hi = mid
+                a = route_wp[max(0, lo - 1)]
+                b = route_wp[min(len(route_wp) - 1, lo + 1)]
+                tx, ty = b.x - a.x, b.y - a.y
+                f = wp2.transform.get_forward_vector()
+                return (f.x * tx + f.y * ty) > 0.3
+            except Exception:
+                return False
+
+        # ── 信号灯绑定（一次性）：停止线 → 参考线弧长 s_stop。
+        # 只绑定「停止线所在车道属于本路线」的灯——管着本路线的灯才有效；
+        # 运行时用 s 差判定：车越过停止线后该灯自动退出考虑（committed 语义），
+        # 路口内/出口不再被交叉方向的红灯误刹。
+        tl_bindings = []
+        try:
+            _route_lane_set = set(l for l in route_lane_ids if l is not None)
+            for _tl in world.get_actors().filter("traffic.traffic_light*"):
+                try:
+                    for _swp in _tl.get_stop_waypoints():
+                        if (_swp.road_id, _swp.lane_id) in _route_lane_set:
+                            _s_stop = _frenet(_swp.transform.location.x,
+                                              _swp.transform.location.y)[0]
+                            tl_bindings.append({"tl": _tl, "s_stop": _s_stop})
+                            break
+                except Exception:
+                    pass
+            if tl_bindings:
+                tl_bindings.sort(key=lambda b: b["s_stop"])
+                _exp_log(f"信号灯绑定: {len(tl_bindings)} 处停止线已关联到路线")
+        except Exception as exc:
+            _exp_log(f"信号灯绑定失败: {exc}")
 
         # 4. 横穿行人
         if spawn_pedestrian:
@@ -423,50 +589,66 @@ def _run_exp10(args):
         cte_history = collections.deque(maxlen=240)
         _dbg_frame = 0  # 诊断日志计数器（每 20 帧≈1s 输出一次）
 
-        # ── 方案A：车道级横向避障状态（只绕「挡在本车道」的障碍 → 换到邻道中心 → 越过回正）──
-        avoiding = False          # 是否处于绕行状态
-        avoid_side = 0            # +1 向左 / -1 向右
-        avoid_lat_target = 0.0    # 目标横向偏移（米，带符号；左正右负）
-        avoid_target_id = None    # 正在绕行的障碍 actor id
-        avoid_target_lane = None  # 触发绕行时被绕障碍所在车道 (road,lane)（车道级退出判据用）
-        avoid_dest_lane = None    # 换道目标车道 (road,lane)（鸟瞰图高亮用）
-        avoid_travel = 0.0        # 进入绕行后累计前进距离
-        avoid_start_pos = None    # 进入绕行时车辆位置
-        AVOID_TRIGGER = 20.0      # 前方障碍进入该距离（m）即触发绕行
-        AVOID_OFFSET = 3.5        # 绕行基础横向偏移（m，邻道信息缺失时的回退值）
-        ego_half_w = float(vehicle.bounding_box.extent.y)  # 自车半宽（走廊判据用）
+        # ── 决策规划状态（Frenet 采样式时空联合规划，参照 Werling/PythonRobotics）──
+        # 每帧重估：行为 FSM 输出意图标签（日志/可视化/教学用），
+        # 6 条候选轨迹（横向 {保持,左换,右换} × 纵向 {巡航,停驻}）经硬约束筛选后取代价最小者。
+        _ego_bb = vehicle.bounding_box.extent
+        ego_half_w = float(_ego_bb.y)    # 自车半宽（碰撞检查/走廊判据用）
+        ego_half_len = float(_ego_bb.x)  # 自车半长（碰撞检查含障碍长度，修"量到中心"缺陷）
+        # 规划参数
+        T_HORIZON = 4.0        # 轨迹展开时长（s）
+        DT_PLAN = 0.25         # 展开步长（s）
+        DEC_WIN = 60.0         # 决策窗口：邻道占用/本道被占的检查范围（m）
+        RED_MARGIN = 3.0       # 红灯停止线前的停止余量（沿 s）
+        STOP_MARGIN = 6.0      # 障碍后缘前的刹停余量（沿 s；前端 safe_distance 滑杆可调）
+        COLL_S = 0.5           # 纵向碰撞余量（m）
+        COLL_L = 0.3           # 横向碰撞余量（m）
+        COMFORT_A = 2.5        # 舒适减速度（STOP 剖面用，m/s²）
+        MAX_DECEL = 4.0        # 最大可用减速度（仲裁用，brake≈1）
+        # 感知模式下无真值尺寸，按类别取典型半长（保守补偿，修"只算障碍中心"缺陷）
+        _PERC_HALF_LEN = {"walker": 0.3, "vehicle": 2.4}
+        # SSE 兼容字段（由规划器驱动，前端零改动）
+        avoiding = False
+        avoid_side = 0
+        avoid_lat_target = 0.0
+        avoid_dest_lane = None
+        fsm_state = "CRUISE"   # 行为状态标签：CRUISE/APPROACH_RED/FOLLOW/LANE_CHANGE
+        _avoid_prev = False    # 上一帧是否换道中（转换日志用）
+        plan_traj = []         # 规划轨迹（世界坐标点列，Pure Pursuit 前视 + 鸟瞰参考线）
+        plan_end_l = 0.0       # 规划轨迹末端的横向偏移（鸟瞰参考线续接用）
 
-        def _route_proj(px, py):
-            """把世界坐标投影到路线：在当前路点前方窗口内找最近路点，
-            返回 (lat, j)：lat = 相对路线切线的横向偏移（左正，与 lat 约定一致）。
-            用于「障碍是否挡在本车道路线走廊内」的几何判据（含车宽）。"""
-            j0 = max(0, wp_idx - 5)
-            j1 = min(len(route_wp), wp_idx + int(60.0 / max(0.5, sampling_res)) + 10)
-            best_j, best_d2 = j0, float("inf")
-            for j in range(j0, j1):
-                d2 = (px - route_wp[j].x) ** 2 + (py - route_wp[j].y) ** 2
-                if d2 < best_d2:
-                    best_d2, best_j = d2, j
-            a = route_wp[max(0, best_j - 1)]
-            b = route_wp[min(len(route_wp) - 1, best_j + 1)]
-            tx, ty = b.x - a.x, b.y - a.y
-            tl = math.hypot(tx, ty)
-            if tl < 1e-6:
-                tx, ty = 1.0, 0.0
-            else:
-                tx, ty = tx / tl, ty / tl
-            rx, ry = px - route_wp[best_j].x, py - route_wp[best_j].y
-            return tx * ry - ty * rx, best_j
+        # ── 规划调试日志系统：逐帧决策细节写入文件（排障用）──
+        # SSE 实验日志只推关键事件（模式切换/异常/结果），高频细节全部落盘：
+        # 每帧一行（自车状态/信号灯/障碍/候选与代价/拒绝统计/控制输出），
+        # 外加事件行（最优解切换/信号灯变化/回退兜底）。文件路径启动时推给前端。
+        import os as _os
+        import tempfile as _tempfile
+        try:
+            _plan_log_dir = _os.path.join(
+                _os.path.dirname(_os.path.abspath(__file__)), "logs")
+        except NameError:
+            _plan_log_dir = _os.path.join(_tempfile.gettempdir(), "carla_exp10_logs")
+        _os.makedirs(_plan_log_dir, exist_ok=True)
+        _plan_log_path = _os.path.join(
+            _plan_log_dir, f"exp10_plan_{time.strftime('%Y%m%d_%H%M%S')}.log")
+        _plan_log_f = open(_plan_log_path, "w", encoding="utf-8", buffering=1)
 
-        def _blocks(fwd_dist, lat_route, lane_id, half_w, lanes_ahead):
-            """障碍是否「挡在本车道」：① 障碍所在车道属于路线前方车道集合；
-            ② 车道信息缺失时按路线走廊几何判据（含双方半宽 + 0.25m 余量）。
-            邻道车辆因不在路线车道、也不在走廊内，不再触发避障/绕行。"""
-            if fwd_dist <= 0.0 or fwd_dist > 50.0:
-                return False
-            if lane_id is not None and lane_id in lanes_ahead:
-                return True
-            return abs(lat_route) < (ego_half_w + half_w + 0.25)
+        def _plan_log(msg):
+            try:
+                _plan_log_f.write(
+                    f"[{time.strftime('%H:%M:%S')}.{int((time.time() % 1) * 1000):03d}] {msg}\n")
+            except Exception:
+                pass
+
+        _plan_log(f"=== 实验10 规划调试日志 start ===")
+        _plan_log(f"参数: target={target_speed} lookahead={lookahead} kp={kp_steer} "
+                  f"safe_dist={safe_dist} brake_force={brake_force} "
+                  f"perception={'on' if perception_mode else 'off'} "
+                  f"route={len(route_wp)}wp 总弧长={s_tab[-1]:.0f}m "
+                  f"tl_bindings={len(tl_bindings)}")
+        _exp_log(f"规划调试日志: {_plan_log_path}")
+        _best_prev_key = None    # 上一帧最优解 (mode, l_t)——切换事件检测
+        _tl_state_prev = None    # 上一帧信号灯状态——变化事件检测
 
         while not _EXP10_ABORT:
             world.tick()  # 同步模式：推进一帧，车辆据此移动
@@ -567,25 +749,20 @@ def _run_exp10(args):
                 loc_err = 0.0
             loc_err_history.append(round(loc_err, 3))
 
-            # 障碍物扫描（车道级判据：只有「挡在本车道/路线走廊」的障碍才计入避障与绕行）
+            # ── 障碍物统一扫描：全量保留（不预筛选本道），输出 Frenet 障碍列表 ──
+            # 筛选交给规划器的碰撞检查——旁道/远端障碍天然进入时空联合检查（修问题5）。
+            # 每个障碍含半长/半宽（修"距离只算到障碍中心"的问题2）。
             front_obstacle = float("inf")
             front_obs_src = "none"
             dst_actor2 = 999.0
             obs_list = []
-            bbox_cands = []               # 包围框相机候选：50m 内的车辆/行人 (actor, 距离)
-            avoid_cand_id = None          # 绕行候选：前方挡道的最近障碍
-            avoid_cand_dist = float("inf")
-            avoid_cand_lat = 0.0          # 候选障碍相对路线切线的横向偏移（左正右负）
-            avoid_cand_lane = None        # 候选障碍所在车道 id
-            detected_lane_fwd = []         # 本帧所有已探测障碍的 (lane_id, 前向距离)，选道/退出判据用
-            perceived = []                # 感知闭环：bbox 相机单目感知到的障碍物
+            obstacles = []            # 统一障碍列表：[{s,l,half_len,half_w,v_s,lane,cls,id}]
+            bbox_cands = []           # 包围框相机候选：50m 内的车辆/行人 (actor, 距离)
+            perceived = []            # 感知闭环：bbox 相机单目感知到的障碍物
             fwd = ego_tf.get_forward_vector()
             left = carla.Vector3D(x=fwd.y, y=-fwd.x, z=0)  # 车体系左向（lat 左正约定；(-fwd.y,fwd.x) 是右向，曾致感知坐标镜像）
-            # 路线前方 60m 涉及的车道集合（判断障碍是否挡在规划路线上）
-            lanes_ahead = set()
-            for j in range(wp_idx, min(len(route_lane_ids), wp_idx + int(60.0 / max(0.5, sampling_res)) + 10)):
-                if route_lane_ids[j] is not None:
-                    lanes_ahead.add(route_lane_ids[j])
+            _scan_j0 = max(0, wp_idx - 5)
+            _scan_j1 = min(len(route_wp), wp_idx + int(70.0 / max(0.5, sampling_res)) + 10)
 
             if perception_on:
                 # ── 感知闭环：不查询世界真值，障碍物只来自 bbox 相机（实例+语义）──
@@ -609,7 +786,7 @@ def _run_exp10(args):
                     # 与真实系统一致：相机检测目标 → 地图匹配 → 车道级行为决策
                     wpx = fused_loc.x + fwd.x * fwd_dist + left.x * lat
                     wpy = fused_loc.y + fwd.y * fwd_dist + left.y * lat
-                    lat_route, _pj = _route_proj(wpx, wpy)
+                    s_o, l_o, _tx, _ty = _frenet(wpx, wpy, _scan_j0, _scan_j1)
                     lane_id = None
                     try:
                         owp = carla_map.get_waypoint(carla.Location(x=wpx, y=wpy, z=0.0),
@@ -618,21 +795,18 @@ def _run_exp10(args):
                             lane_id = (owp.road_id, owp.lane_id)
                     except Exception:
                         pass
-                    detected_lane_fwd.append((lane_id, fwd_dist))
-                    half_w = max(0.3, p["width_m"] / 2.0)
-                    if _blocks(fwd_dist, lat_route, lane_id, half_w, lanes_ahead):
-                        if fwd_dist < front_obstacle:
-                            front_obstacle = fwd_dist
-                            front_obs_src = p["cls"]
-                        if fwd_dist < avoid_cand_dist:
-                            avoid_cand_dist = fwd_dist
-                            avoid_cand_lat = lat_route
-                            avoid_cand_lane = lane_id
+                    obstacles.append({
+                        "s": s_o, "l": l_o,
+                        "half_len": _PERC_HALF_LEN.get(p["cls"], 2.0),  # 类别典型半长（保守）
+                        "half_w": max(0.3, p["width_m"] / 2.0),
+                        "v_s": 0.0,   # 单帧感知无速度估计（多帧跟踪是进阶内容）
+                        "lane": lane_id, "cls": p["cls"], "id": None,
+                    })
                     obs_list.append({
                         "category": _EXP10_PERC_STYLE.get(p["cls"], ("目标",))[0],
                         "dist": round(p["dist"], 1), "size": round(p["width_m"], 1),
                         "x": round(wpx, 1), "y": round(wpy, 1),  # 感知估计的世界坐标（鸟瞰图标记）
-                        "vel": None,  # 单帧感知无速度估计（多帧跟踪是进阶内容）
+                        "vel": None,
                     })
             else:
                 actor_list = world.get_actors()
@@ -649,12 +823,8 @@ def _run_exp10(args):
                     vel = actor.get_velocity()
                     speed = math.sqrt(vel.x ** 2 + vel.y ** 2)
                     bb = actor.bounding_box.extent
-                    # 前向投影（车头系，用于距离）
-                    rel = actor.get_location() - fused_loc
-                    fwd_dist = fwd.x * rel.x + fwd.y * rel.y
-                    # 车道级判据：障碍位置 → 路线系横向偏移 + 所在车道
                     aloc = actor.get_location()
-                    lat_route, _pj = _route_proj(aloc.x, aloc.y)
+                    s_o, l_o, tx_o, ty_o = _frenet(aloc.x, aloc.y, _scan_j0, _scan_j1)
                     lane_id = None
                     try:
                         owp = carla_map.get_waypoint(aloc, project_to_road=True, lane_type=carla.LaneType.Driving)
@@ -662,16 +832,13 @@ def _run_exp10(args):
                             lane_id = (owp.road_id, owp.lane_id)
                     except Exception:
                         pass
-                    detected_lane_fwd.append((lane_id, fwd_dist))
-                    if _blocks(fwd_dist, lat_route, lane_id, bb.y, lanes_ahead):
-                        if fwd_dist < front_obstacle:
-                            front_obstacle = fwd_dist
-                            front_obs_src = tid
-                        if fwd_dist < avoid_cand_dist:
-                            avoid_cand_dist = fwd_dist
-                            avoid_cand_lat = lat_route
-                            avoid_cand_id = actor.id
-                            avoid_cand_lane = lane_id
+                    obstacles.append({
+                        "s": s_o, "l": l_o,
+                        "half_len": float(bb.x),   # 真值模式：包围盒半长（extent 为半尺寸）
+                        "half_w": float(bb.y),
+                        "v_s": vel.x * tx_o + vel.y * ty_o,  # 沿参考线的纵向速度
+                        "lane": lane_id, "cls": tid, "id": actor.id,
+                    })
                     bbox_cands.append((actor, dist))
                     obs_list.append({
                         "category": _dynamic_class(tid),
@@ -702,142 +869,324 @@ def _run_exp10(args):
             else:
                 _bbox_diag["skip"] += 1
 
-            # 红绿灯：只考虑车辆正前方、大致同车道（侧向<5m）的灯，
-            # 避免把路边/身后/交叉口相邻车道的红灯误当成本车道红灯导致误刹
-            tl_state = "green"
-            tl_dist = 999.0
-            try:
-                ego_fwd = ego_tf.get_forward_vector()
-                tls = world.get_actors().filter("traffic.traffic_light*")
-                for tl in tls:
-                    rel = tl.get_location() - fused_loc
-                    ahead = ego_fwd.x * rel.x + ego_fwd.y * rel.y
-                    if ahead <= 0:          # 在后方或侧面，忽略
-                        continue
-                    lateral = abs(ego_fwd.x * rel.y - ego_fwd.y * rel.x)
-                    if lateral > 5.0:       # 不在本车道 / 太偏，忽略
-                        continue
-                    if ahead < 30 and ahead < tl_dist:
-                        tl_dist = ahead
-                        tl_state = _TL_STATE_MAP.get(tl.state, "green")
-            except Exception:
-                pass
-
-            # 车速（先于避障决策与纵向控制，供同帧使用）
+            # 车速（先于红绿灯判定与决策规划，供同帧使用）
             vel = vehicle.get_velocity()
             spd = math.sqrt(vel.x ** 2 + vel.y ** 2)
 
-            # ── 方案A：车道级横向避障决策（先于纵向控制，保证触发/退出与制动同帧生效）──
-            # 触发：挡在本车道的障碍进入 AVOID_TRIGGER 即触发（不限车速，避免低速被刹停在障碍前）；
-            # 退出：被绕障碍所在车道的前方已无障碍（均已到侧后方）且前进≥10m（或绕行超距兜底）。
-            avoid_cand_behind = False
-            if avoid_target_lane is not None:
-                # 车道级退出：原车道上「还在前方(-1~25m)」的障碍清空即认为已越过
-                avoid_cand_behind = not any(
-                    l == avoid_target_lane and -1.0 < f < 25.0 for l, f in detected_lane_fwd)
-            elif perception_on:
-                # 感知闭环回退：相机只能看见前方，视野内已无任何挡道目标即准备回正
-                avoid_cand_behind = math.isinf(avoid_cand_dist)
-            elif avoid_target_id is not None:
-                try:
-                    ta = world.get_actor(avoid_target_id)
-                    if ta is None:
-                        avoid_cand_behind = True
-                    else:
-                        trel = ta.get_location() - fused_loc
-                        if fwd.x * trel.x + fwd.y * trel.y < -3.0:
-                            avoid_cand_behind = True
-                except Exception:
-                    avoid_cand_behind = True
+            # ── 红绿灯（停止线绑定 + s 判定，修问题1）──
+            # 有效灯 = 绑定到本路线、且停止线仍在前方(0.5~80m)的最近一个；
+            # 车越过停止线后 s 差变负，该灯自动退出考虑——路口内/出口不再被
+            # 交叉方向的红灯误刹（committed 语义由 s 比较天然实现）。
+            tl_state = "green"
+            tl_dist = 999.0
+            red_stop_s = None
+            ego_s, ego_l, ego_tx, ego_ty = _frenet(fused_loc.x, fused_loc.y, _scan_j0, _scan_j1)
+            v_long = max(0.0, vel.x * ego_tx + vel.y * ego_ty)   # 纵向车速（沿参考线）
+            for b in tl_bindings:
+                d = b["s_stop"] - ego_s
+                if 0.5 < d < 80.0 and d < tl_dist:
+                    try:
+                        st = _TL_STATE_MAP.get(b["tl"].state, "green")
+                    except Exception:
+                        continue
+                    tl_dist, tl_state = d, st
+                    red_stop_s = (b["s_stop"] - RED_MARGIN) if st == "red" else None
+            if tl_state != _tl_state_prev:
+                _plan_log(f"EVENT 信号灯: {_tl_state_prev} → {tl_state} "
+                          f"@前方{tl_dist:.0f}m (red_stop_s="
+                          f"{f'{red_stop_s:.1f}' if red_stop_s is not None else 'None'})")
+                _tl_state_prev = tl_state
 
-            if avoiding:
-                if avoid_start_pos is not None:
-                    avoid_travel = fused_loc.distance(avoid_start_pos)
-                if (avoid_cand_behind and avoid_travel >= 10.0) or avoid_travel >= 70.0:
-                    avoiding = False
-                    avoid_side = 0
-                    avoid_lat_target = 0.0
-                    avoid_target_id = None
-                    avoid_target_lane = None
-                    avoid_dest_lane = None
-                    _exp_log("绕行完成，回正车道")
-            elif avoid_cand_dist < AVOID_TRIGGER and (perception_on or avoid_cand_id is not None):
-                avoiding = True
-                avoid_target_id = avoid_cand_id
-                avoid_target_lane = avoid_cand_lane
-                avoid_dest_lane = None
-                avoid_start_pos = fused_loc
-                avoid_travel = 0.0
-                # 选边（车道级）：优先「可行驶、同向、前方无障碍」的相邻车道，换道目标=邻道中心
-                lane_pick = None
-                try:
-                    ewp = carla_map.get_waypoint(fused_loc, project_to_road=True, lane_type=carla.LaneType.Driving)
-                    if ewp is not None:
-                        occupied = {l for l, f in detected_lane_fwd if l is not None and -1.0 < f < 30.0}
-                        for nb in (ewp.get_left_lane(), ewp.get_right_lane()):
-                            if nb is None or nb.lane_type != carla.LaneType.Driving:
-                                continue
-                            nf = nb.transform.get_forward_vector()
-                            if nf.x * fwd.x + nf.y * fwd.y <= 0.0:
-                                continue  # 对向车道，不可选
-                            if (nb.road_id, nb.lane_id) in occupied:
-                                continue  # 邻道前方有障碍，不可选
-                            nlat, _pj = _route_proj(nb.transform.location.x, nb.transform.location.y)
-                            lane_pick = (1 if nlat >= 0 else -1,
-                                         max(3.0, min(5.5, (ewp.lane_width + nb.lane_width) / 2.0)))
-                            avoid_dest_lane = (nb.road_id, nb.lane_id)
-                            break
-                except Exception:
-                    pass
-                if lane_pick is not None:
-                    avoid_side, mag = lane_pick
-                else:
-                    # 回退：邻道信息缺失时按几何启发式（障碍偏左就右绕、偏右就左绕；居中默认左）
-                    avoid_side = 1 if abs(avoid_cand_lat) < 0.8 else (1 if avoid_cand_lat < 0 else -1)
-                    mag = max(3.0, min(5.5, abs(avoid_cand_lat) + AVOID_OFFSET))
-                avoid_lat_target = avoid_side * mag
-                _exp_log(f"前方 {avoid_cand_dist:.0f}m 本车道内有障碍，换道绕行{'左' if avoid_side > 0 else '右'}（偏移 {mag:.1f}m）")
-
-            # 纵向控制：绕行期间忽略"前方障碍"的制动力（避免被刹停在障碍前），红绿灯制动仍生效。
-            # 采用"所需减速度 + 最苛刻约束仲裁"：红绿灯停车线 / 前方障碍 / 黄灯各约束分别
-            # 按当前车速，计算为在各自目标点停下所需的最小减速度 a=v²/(2d)，取最苛刻者施加。
-            # 物理风险（障碍、红灯）因所需减速度大而天然压过黄灯（规则）——车速不足时所需
-            # 减速度增大、刹车自动加重，满足"障碍优先于黄灯、车速不足则刹停"。
-            brake_obstacle = float("inf") if avoiding else front_obstacle
+            # ── 决策 + 规划：Frenet 采样式时空联合（每帧重估，修问题2/3/4/5）──
+            # 候选 = 横向{保持,左换,右换} × 纵向{巡航,停驻}，五次多项式横向剖面；
+            # 硬约束（碰撞/可行驶域/红灯）逐时刻检查全量障碍（含长度、含旁道、含动态外推）；
+            # 代价最小者胜出；全部被拒 → 本道刹停兜底（横向不够纵向补）。
+            STOP_MARGIN = max(3.0, safe_dist * 0.5)   # 刹停余量（safe_distance 滑杆联动，默认12→6m）
             throttle = 0.0
             brake = 0.0
-
-            MAX_DECEL = 4.0            # 最大可用减速度 (m/s²)，对应 brake≈1
-            COMFORT_D = 0.8            # 低于此减速度无需制动（正常巡航 / 跟车）
-            YELLOW_D = 1.0             # 黄灯"建议减速"幅度 (m/s²)，软约束
-            OBS_MARGIN = safe_dist     # 刹停后与前方障碍保持的安全距离
-            RED_MARGIN = 3.0           # 距红灯停车线前的停止余量
-
             a_need = 0.0
             desired = target_speed
-            red_state = tl_state == "red"
 
-            # 障碍约束：在距离 d 内降速到 0，并预留 OBS_MARGIN 安全间距
-            if brake_obstacle < float("inf"):
-                d_obs = max(0.0, brake_obstacle - OBS_MARGIN)
-                a_obs = MAX_DECEL if d_obs <= 0.0 else spd * spd / (2.0 * d_obs)
-                a_need = max(a_need, a_obs)
-                desired = min(desired, math.sqrt(2.0 * MAX_DECEL * d_obs))
+            # 可行驶域 + 车道宽度（无车道信息时退化为「只保持车道」的安全模式）
+            bnds = _drivable_bounds(wp_idx) if wp_idx < len(route_wp) else None
+            w_lane = 3.5
+            try:
+                _wp_cur = route_wps[wp_idx] if wp_idx < len(route_wps) else None
+                if _wp_cur is not None and _wp_cur.lane_width:
+                    w_lane = float(_wp_cur.lane_width)
+            except Exception:
+                pass
+            l_min = l_max = None
+            if bnds is not None and bnds[0] is not None:
+                l_min, l_max = bnds
 
-            # 红灯停车线约束：在距离 d 内降速到 0
-            if red_state:
-                d_stop = max(0.0, tl_dist - RED_MARGIN)
-                a_red = MAX_DECEL if d_stop <= 0.0 else spd * spd / (2.0 * d_stop)
-                a_need = max(a_need, a_red)
-                desired = min(desired, math.sqrt(2.0 * MAX_DECEL * d_stop))
+            # 邻道候选（clamp 进可行驶域：对向侧边界自动收缩，无可行邻道则该侧消失）。
+            # 每侧独立判定：该侧窄/对向 → 跳过该侧但不中断另一侧（原 break 会连
+            # 另一侧一起跳过）；目标偏移点再做一次地图级同向校验（双保险防逆行）
+            _neighbors = []
+            if l_min is not None:
+                lo_b = l_min + ego_half_w + COLL_L
+                hi_b = l_max - ego_half_w - COLL_L
+                for l_t in (w_lane, -w_lane):
+                    if lo_b >= hi_b - 0.2:
+                        break      # 域过窄（如仅一条车道），只保持
+                    l_c = max(lo_b, min(hi_b, l_t))
+                    if abs(l_c) < 0.5:
+                        continue   # clamp 后已贴回本道，不算可行邻道
+                    # 前方 12m 处该横向偏移落点必须是同向 Driving 车道（防对向）
+                    if not _lat_lane_ok(l_c, ego_s + 12.0):
+                        _plan_log(f"EVENT 邻道 {l_c:+.1f}m 被方向校验否决（对向/交叉车道）")
+                        continue
+                    _neighbors.append(l_c)
 
-            # 黄灯：软约束。仅当没有更紧急的红灯/障碍亟需更高减速度时生效，
-            # 保证"障碍优先于黄灯"——障碍已要求更高减速度时，黄灯不再加重刹车。
-            if tl_state == "yellow" and not red_state and a_need < YELLOW_D:
+            def _obs_stop(l_t):
+                """走廊内最近障碍停驻点（后缘-余量，动态障碍 1s 前瞻）；inf = 走廊无障碍"""
+                s_stop = float("inf")
+                for o in obstacles:
+                    if abs(o["l"] - l_t) < ego_half_w + o["half_w"] + 0.25:
+                        rear = o["s"] + max(0.0, o["v_s"]) * 1.0 - o["half_len"]
+                        if ego_s + 0.5 < rear < ego_s + DEC_WIN or ego_s + 0.5 < o["s"] + o["half_len"] < ego_s + DEC_WIN:
+                            s_stop = min(s_stop, rear - STOP_MARGIN)
+                return s_stop
+
+            def _corridor_stop(l_t):
+                """走廊内最近停驻点 = min(障碍停驻点, 红灯停止线)"""
+                s_obs = _obs_stop(l_t)
+                if red_stop_s is not None:
+                    return red_stop_s if s_obs == float("inf") else min(red_stop_s, s_obs)
+                return s_obs
+
+            # ── 行为决策（FSM 意图，修问题3/5 的"逐个处理"与"不查旁道"）──
+            # 本道走廊被占 → 选「走廊无障碍且在可行驶域内」的邻道换道（先左后右，
+            # 超车靠左惯例）；两侧皆不可行 → 保持+跟停（安全兜底，不冒险切道）。
+            # 换道途中每帧重估：邻道新出现障碍/本道清空都会即时改变意图。
+            _blocked = _obs_stop(0.0) < float("inf")
+            intent_l = 0.0
+            if _blocked:
+                for l_t in _neighbors:
+                    if _obs_stop(l_t) == float("inf"):
+                        intent_l = l_t
+                        break
+            lat_targets = [0.0] if intent_l == 0.0 else [intent_l, 0.0]
+
+            # 候选生成与展开
+            cands = []
+            _rej_bounds = _rej_red = _rej_coll = _rej_dir = 0   # 拒绝统计（日志用）
+            _n_steps = int(T_HORIZON / DT_PLAN)
+            T_lat = max(2.0, min(4.0, 1.2 * max(2.0, v_long)))
+            for l_t in lat_targets:
+                s_stop = _corridor_stop(l_t)
+                for mode in ("CRUISE", "STOP"):
+                    if mode == "STOP" and s_stop == float("inf"):
+                        continue   # 无停驻点则无需 STOP 候选
+                    if mode == "CRUISE":
+                        a_long = max(-2.0, min(1.5, (target_speed - v_long) / 2.0))
+                    else:
+                        d = s_stop - ego_s
+                        a_long = 0.0 if d <= 0.5 else max(-MAX_DECEL, -(v_long * v_long) / (2.0 * d))
+                    # 逐时刻展开：横向五次多项式（最小急动度）+ 纵向逐步积分。
+                    # CRUISE 按停驻点（红灯/障碍）生成舒适制动剖面
+                    # v ≤ √(2·COMFORT_A·(s_stop−s))，到停止线恰好停住。
+                    # 顺序要点（修期望速度横跳）：① 物理减速度下限先施加；
+                    # ② 剖面钳制最后施加且允许超过舒适值——若剖面放在下限之前，
+                    # 贴线归零会被下限顶回 v>0.3，整条 CRUISE 被红灯硬约束拒掉，
+                    # 与 STOP 候选逐帧轮替胜出 → desired 在最大/最小间跳变。
+                    samples = []
+                    ok = True
+                    dl = l_t - ego_l
+                    s_prev, v_prev = ego_s, v_long
+                    for k in range(1, _n_steps + 1):
+                        tk = k * DT_PLAN
+                        tau = min(1.0, tk / T_lat)
+                        l_k = ego_l + dl * tau ** 3 * (10.0 - 15.0 * tau + 6.0 * tau * tau)
+                        v_k = max(0.0, v_prev + a_long * DT_PLAN)
+                        v_k = max(v_k, v_prev - MAX_DECEL * DT_PLAN)   # 物理极限内
+                        if mode == "CRUISE":
+                            if a_long > 0.0:
+                                v_k = min(v_k, target_speed)
+                            if s_stop < float("inf"):
+                                v_k = min(v_k, math.sqrt(
+                                    2.0 * COMFORT_A * max(0.0, s_stop - s_prev)))
+                                # 贴线归零：本步内将抵达停止线就停（判据=剩余距离
+                                # 小于本步行程，而非固定 0.2m——低速步长 0.5m 会被
+                                # 漏判带速越线触发整条拒绝）
+                                if s_stop - s_prev <= max(0.25, v_prev * DT_PLAN):
+                                    v_k = 0.0
+                        s_k = s_prev + 0.5 * (v_prev + v_k) * DT_PLAN
+                        s_prev, v_prev = s_k, v_k
+                        # 硬约束①：可行驶域（越界即逆行/出路缘，整条拒绝）。
+                        # 逐点取「当地」边界——轨迹展开 30m+，前方路段可能收窄/
+                        # 变两车道，只用车头处边界会放行前方的对向车道（蓝线逆行）
+                        if l_min is not None:
+                            b_k = _bounds_at_s(s_k)
+                            if b_k is None:
+                                b_k = (l_min, l_max)
+                            if (l_k < min(b_k[0] + ego_half_w + COLL_L, ego_l - 0.05)
+                                    or l_k > max(b_k[1] - ego_half_w - COLL_L, ego_l + 0.05)):
+                                _rej_bounds += 1
+                                ok = False
+                                break
+                        # 硬约束②：红灯（CRUISE 不得带速越过停止线）
+                        if (mode == "CRUISE" and red_stop_s is not None
+                                and s_k > red_stop_s and v_k > 0.3):
+                            _rej_red += 1
+                            ok = False
+                            break
+                        # 硬约束③：碰撞——对全量障碍（含长度、含动态外推、含旁道）
+                        for o in obstacles:
+                            if o["s"] < ego_s - 1.0 and o["v_s"] > v_long:
+                                continue   # 后方更快的超车车辆：后车责任，不因此误刹
+                            s_o = o["s"] + o["v_s"] * tk
+                            if (abs(s_k - s_o) < o["half_len"] + ego_half_len + COLL_S
+                                    and abs(l_k - o["l"]) < o["half_w"] + ego_half_w + COLL_L):
+                                _rej_coll += 1
+                                ok = False
+                                break
+                        if not ok:
+                            break
+                        samples.append((tk, s_k, l_k, v_k))
+                    if not ok or not samples:
+                        continue
+                    # 换道候选：中段与末端落点必须是同向 Driving 车道。
+                    # 边界缓存按「邻接链+点积」推断，路口/车道斜接处可能漏判对向
+                    # （如左换道落在交叉来车道上）——地图级查询兜底，逆行零容忍
+                    if abs(dl) > 0.5:
+                        if not (_lat_lane_ok(l_t, samples[len(samples) // 2][1])
+                                and _lat_lane_ok(l_t, samples[-1][1])):
+                            _rej_dir += 1
+                            continue
+                    # 代价：意图对齐（决策层意图优先，非意图轨迹仅作兜底）+
+                    # 偏离参考线 + 横摆平顺 + 舒适性 + 效率 + 换道机动惩罚
+                    l_arr = [ego_l] + [sm[2] for sm in samples]
+                    j_lat = sum(x * x for x in l_arr) / len(l_arr)
+                    j_dl = sum(((l_arr[i + 1] - l_arr[i]) / DT_PLAN) ** 2
+                               for i in range(len(l_arr) - 1)) / max(1, len(l_arr) - 1)
+                    v_end = samples[-1][3]
+                    cost = (0.5 * j_lat + 0.3 * j_dl + 0.2 * a_long * a_long
+                            + 0.4 * max(0.0, target_speed - v_end)
+                            + (0.6 if abs(l_t) > 0.5 else 0.0)
+                            + (0.0 if l_t == intent_l else 5.0))
+                    cands.append({"cost": cost, "l_t": l_t, "mode": mode,
+                                  "s_stop": s_stop, "a_long": a_long, "samples": samples})
+
+            best = min(cands, key=lambda c: c["cost"]) if cands else None
+            if best is not None:
+                # 由最优候选导出控制量与可视化状态
+                if best["mode"] == "STOP":
+                    d = max(0.1, best["s_stop"] - ego_s)
+                    a_need = v_long * v_long / (2.0 * d)
+                    if v_long < 0.5 and d < 2.0:
+                        a_need = 1.5   # 已近停驻点：保持制动，防止油门分支蠕行越线
+                    desired = 0.0
+                else:
+                    desired = target_speed
+                    if best["s_stop"] < float("inf"):
+                        d = max(0.0, best["s_stop"] - ego_s)
+                        desired = min(desired, math.sqrt(2.0 * COMFORT_A * d))
+                        # 车速高于剖面期望 → 按剖面所需减速度主动制动
+                        # （速度 P 控制的 0.25 油门基线自身减不了速）
+                        if v_long > desired + 0.3 and d > 0.5:
+                            a_need = min(MAX_DECEL,
+                                         (v_long * v_long - desired * desired) / (2.0 * d))
+                        if v_long < 0.5 and d < 2.0:
+                            a_need = max(a_need, 1.5)   # 近停止线保持制动防蠕行
+                plan_traj = [_world(sm[1], sm[2]) for sm in best["samples"]]
+                plan_end_l = best["samples"][-1][2] if best["samples"] else ego_l
+                avoid_lat_target = best["l_t"]
+                avoiding = abs(best["l_t"]) > 0.5
+                avoid_side = 1 if best["l_t"] > 0.5 else (-1 if best["l_t"] < -0.5 else 0)
+            else:
+                # 兜底：无可行轨迹（本道与旁道皆被占/过近）→ 当前走廊内刹停
+                s_stop = _corridor_stop(ego_l)
+                d = max(0.1, s_stop - ego_s) if s_stop < float("inf") else 0.1
+                a_need = min(MAX_DECEL, v_long * v_long / (2.0 * d))
+                if v_long < 0.5:
+                    a_need = 1.5   # 已停：保持制动防蠕行
+                desired = 0.0
+                plan_traj = [_world(ego_s + 2.0 * i, ego_l) for i in range(1, 16)]
+                plan_end_l = ego_l
+                avoiding = False
+                avoid_side = 0
+                avoid_lat_target = ego_l
+                _plan_log(f"EVENT 无可行候选 → 兜底刹停 (rej: 域{_rej_bounds}/"
+                          f"红{_rej_red}/碰{_rej_coll}/向{_rej_dir})")
+
+            # 逐帧决策日志（排障主数据：一帧一行，状态+决策+控制全链路）
+            _bk = (best["mode"], round(best["l_t"], 1)) if best is not None else ("FALLBACK", None)
+            if _bk != _best_prev_key:
+                _plan_log(f"EVENT 最优解切换: {_best_prev_key} → {_bk}")
+                _best_prev_key = _bk
+            _obs_str = ",".join(f"{o['s']:.0f}/{o['l']:+.1f}" for o in obstacles[:3])
+            _cost_str = f"/c={best['cost']:.2f}" if best is not None else ""
+            _plan_log(
+                f"FRM t={t:6.1f} v={spd:5.2f}(lon {v_long:5.2f}) s={ego_s:7.1f} l={ego_l:+5.2f} "
+                f"tl={tl_state[:3]}/{tl_dist:5.1f}m obs={len(obstacles)}[{_obs_str}] "
+                f"blk={'Y' if _blocked else 'N'} itn={intent_l:+5.2f} nb={[round(x, 1) for x in _neighbors]} "
+                f"cands={len(cands)} best={_bk[0]}{_cost_str} "
+                f"des={desired:5.2f} a={a_need:5.2f} "
+                f"rej:域{_rej_bounds}/红{_rej_red}/碰{_rej_coll}/向{_rej_dir}")
+
+            # SSE 兼容：换道目标车道（鸟瞰图高亮）。
+            # 高亮前做同向校验——邻接链查询可能拿到对向/交叉车道，高亮到逆行
+            # 车道上会误导观测（规划层已有 _lat_lane_ok 双保险，此处管展示）
+            avoid_dest_lane = None
+            if avoiding:
+                try:
+                    _wp_cur = route_wps[wp_idx] if wp_idx < len(route_wps) else None
+                    if _wp_cur is not None:
+                        nb = _wp_cur.get_left_lane() if avoid_side > 0 else _wp_cur.get_right_lane()
+                        if nb is not None and nb.lane_type == carla.LaneType.Driving:
+                            _cf = _wp_cur.transform.get_forward_vector()
+                            _nf = nb.transform.get_forward_vector()
+                            if _nf.x * _cf.x + _nf.y * _cf.y > 0.3:
+                                avoid_dest_lane = (nb.road_id, nb.lane_id)
+                except Exception:
+                    pass
+
+            # 行为状态标签（教学/日志/可视化用；决策本身每帧重估无状态依赖）
+            _blocked_now = any(
+                abs(o["l"] - ego_l) < ego_half_w + o["half_w"] + 0.25
+                and ego_s < o["s"] + o["half_len"] < ego_s + DEC_WIN
+                for o in obstacles)
+            if avoiding:
+                _fsm_new = "LANE_CHANGE"
+            elif red_stop_s is not None:
+                _fsm_new = "APPROACH_RED"
+            elif _blocked_now:
+                _fsm_new = "FOLLOW"
+            else:
+                _fsm_new = "CRUISE"
+            # 状态/换道转换日志（教学观测用；CRUISE 回归不刷屏）
+            if avoiding and not _avoid_prev:
+                _exp_log(f"{'左' if avoid_side > 0 else '右'}侧邻道可行，换道绕行（目标偏移 {abs(avoid_lat_target):.1f}m）")
+            elif not avoiding and _avoid_prev:
+                _exp_log("绕行完成，回正车道")
+            _avoid_prev = avoiding
+            if _fsm_new != fsm_state:
+                if _fsm_new == "APPROACH_RED":
+                    _exp_log(f"前方 {tl_dist:.0f}m 红灯，减速停车（停止线判定）")
+                elif _fsm_new == "FOLLOW":
+                    _exp_log("本车道被占且邻道不可行，跟停等待")
+                fsm_state = _fsm_new
+
+            # 展示用：本道走廊内最近障碍（到后缘的距离，含半长——修"量到中心"缺陷）
+            front_obstacle = float("inf")
+            for o in obstacles:
+                if (abs(o["l"] - ego_l) < ego_half_w + o["half_w"] + 0.25
+                        and o["s"] - o["half_len"] > ego_s):
+                    d_rear = o["s"] - o["half_len"] - ego_s
+                    if d_rear < front_obstacle:
+                        front_obstacle = d_rear
+                        front_obs_src = o["cls"]
+
+            # 黄灯：软约束（红灯/障碍已由规划层硬约束处理，此处不叠加）
+            YELLOW_D = 1.0
+            if tl_state == "yellow" and a_need < YELLOW_D:
                 a_need = YELLOW_D
                 desired = min(desired, target_speed * 0.5)
 
             # 施加制动：低于阈值视为无需主动刹车（正常巡航/跟车），否则按所需减速度占比输出
+            COMFORT_D = 0.8
             if a_need > COMFORT_D:
                 brake = min(1.0, max(0.0, (a_need / MAX_DECEL) * brake_force))
             else:
@@ -845,10 +1194,11 @@ def _run_exp10(args):
                 throttle = max(0.0, min(1.0, 0.25 + 0.12 * err))
             speed_history.append(round(spd, 2))
 
-            # 横向控制 (Pure Pursuit) —— 与实验8/9 相同的已验证实现：
-            # 1) 前视点以车辆当前位置为基准，向前找第一个距离 ≥ lookahead 的路点；
-            #    车辆不动时前视点保持不动（不再每帧前跳），避免前视点被推远导致转向饱和/偏航。
-            # 2) 转向角用标准单车模型公式，符号与实验8/9 一致（实测可正常跟线）。
+            # 横向控制 (Pure Pursuit) —— 前视点改取自「规划轨迹」：
+            # 1) 先在路线点列上校正 wp_idx（进度推进/障碍窗口/可视化共用）；
+            # 2) 前视点 = 规划轨迹上距自车 ≥ lookahead 的第一个点（含换道 S 弯，
+            #    替代原「路线点+法向平移」的两段式做法——跟踪的就是规划器输出本身）；
+            # 3) 规划轨迹不够远（低速/临近停车）时回退到路线点。
             if route_wp:
                 loc = fused_loc   # 用带噪声的融合定位驱动控制；真值仅用于误差评估
                 yaw_rad = math.radians(fused_yaw_deg)  # 用融合航向（GNSS+INS 递推），不再用真值航向
@@ -861,33 +1211,21 @@ def _run_exp10(args):
                         best_d = d
                         best = j
                 wp_idx = best
-                # 2) 前视点：车前第一个距离 ≥ lookahead 的点；找不到则取末尾
-                target_idx = wp_idx
-                for j in range(wp_idx, len(route_wp)):
-                    if math.hypot(loc.x - route_wp[j].x, loc.y - route_wp[j].y) >= lookahead:
-                        target_idx = j
+                # 2) 前视点：优先规划轨迹，回退路线点列
+                look_x, look_y = None, None
+                for px, py in plan_traj:
+                    if math.hypot(px - loc.x, py - loc.y) >= lookahead:
+                        look_x, look_y = px, py
                         break
-                else:
-                    target_idx = len(route_wp) - 1
-                look_pt = route_wp[target_idx]
-                # 绕行：把前视目标点沿路线法向平移（路线坐标系，避免随车头旋转导致绕圈）
-                if avoiding:
-                    i0 = max(0, target_idx - 1)
-                    i1 = min(len(route_wp) - 1, target_idx + 1)
-                    tx0 = route_wp[i1].x - route_wp[i0].x
-                    ty0 = route_wp[i1].y - route_wp[i0].y
-                    tl0 = math.hypot(tx0, ty0)
-                    if tl0 > 1e-6:
-                        tx0, ty0 = tx0 / tl0, ty0 / tl0
+                if look_x is None:
+                    for j in range(wp_idx, len(route_wp)):
+                        if math.hypot(loc.x - route_wp[j].x, loc.y - route_wp[j].y) >= lookahead:
+                            look_x, look_y = route_wp[j].x, route_wp[j].y
+                            break
                     else:
-                        tx0, ty0 = fwd.x, fwd.y
-                    look_pt = carla.Location(
-                        x=look_pt.x + (-ty0) * avoid_lat_target,
-                        y=look_pt.y + tx0 * avoid_lat_target,
-                        z=look_pt.z,
-                    )
-                dx = look_pt.x - loc.x
-                dy = look_pt.y - loc.y
+                        look_x, look_y = route_wp[-1].x, route_wp[-1].y
+                dx = look_x - loc.x
+                dy = look_y - loc.y
                 # 3) 转向角（标准 Pure Pursuit）。
                 # steer_angle/1.22 把前轮角(最大约70°=1.22rad)映射到 [-1,1] 已是合理幅度；
                 # kp_steer 为教学灵敏度：前端默认 1.4，除以 1.4 使默认时=标准幅度，
@@ -899,7 +1237,6 @@ def _run_exp10(args):
                 cte = dx * math.sin(yaw_rad) - dy * math.cos(yaw_rad)
                 look_dist = math.hypot(dx, dy)
             else:
-                look_pt = gt_loc
                 dx = dy = 0.0
                 raw_steer = 0.0
                 cte = 0.0
@@ -930,7 +1267,8 @@ def _run_exp10(args):
                     f"fused=({fused_loc.x:.1f},{fused_loc.y:.1f}) p={ego_tf.rotation.pitch:.0f} r={ego_tf.rotation.roll:.0f} "
                     f"obs={front_obstacle if front_obstacle != float('inf') else 'inf'}({front_obs_src}) "
                     f"tl={tl_state}/{tl_dist:.0f}m wp={wp_idx}/{len(route_wp)} "
-                    f"avd={'L' if avoid_side > 0 else 'R' if avoid_side < 0 else '-'}{avoid_target_lane if avoid_target_lane is not None else ''} "
+                    f"fsm={fsm_state} avd={'L' if avoid_side > 0 else 'R' if avoid_side < 0 else '-'} "
+                    f"s={ego_s:.0f} l={ego_l:+.1f} "
                     f"loc=({gt_loc.x:.1f},{gt_loc.y:.1f})"
                 )
 
@@ -979,25 +1317,36 @@ def _run_exp10(args):
                 d = math.hypot(route_wp[j].x - fused_loc.x, route_wp[j].y - fused_loc.y)
                 plan_lanes.append({"lane": [lk[0], lk[1]], "dist": round(d, 1)})
 
-            # 参考线：前方 60m 每 2m 一点；避障时沿路线法向平移（自车处偏移 0、
-            # 12m 处渐变到全幅，自然呈现 S 形换道轨迹）
+            # 参考线 = 规划轨迹（含换道 S 弯）+ 超出轨迹末端的路线点续接。
+            # 续接段必须从「轨迹末端距离」接着往后取，而非从车旁重新取起，
+            # 否则绘制顺序变成：先画到前方目标车道、再跳回车旁从本道重画一遍。
             ref_path = []
-            if route_wp:
+            d_covered = 0.0
+            for px, py in plan_traj:
+                _d = math.hypot(px - fused_loc.x, py - fused_loc.y)
+                if _d <= 60.0:
+                    d_covered = max(d_covered, _d)
+                    ref_path.append({"x": round(px, 1), "y": round(py, 1)})
+            if route_wp and len(ref_path) < 30:
                 step_j = max(1, int(round(2.0 / max(0.5, sampling_res))))
                 for j in range(wp_idx, len(route_wp), step_j):
                     px, py = route_wp[j].x, route_wp[j].y
-                    if len(ref_path) >= 5 and math.hypot(px - fused_loc.x, py - fused_loc.y) > 60.0:
+                    d = math.hypot(px - fused_loc.x, py - fused_loc.y)
+                    if d <= d_covered + 1.0:
+                        continue   # 规划轨迹已覆盖的近段不重复，从轨迹末端续接
+                    if len(ref_path) >= 5 and d > 60.0:
                         break
-                    if avoiding:
-                        a = route_wp[max(0, j - 1)]
-                        b = route_wp[min(len(route_wp) - 1, j + 1)]
-                        tx, ty = b.x - a.x, b.y - a.y
-                        tl = math.hypot(tx, ty)
-                        if tl > 1e-6:
-                            d = math.hypot(px - fused_loc.x, py - fused_loc.y)
-                            off = avoid_lat_target * max(0.0, min(1.0, d / 12.0))
-                            px -= (ty / tl) * off
-                            py += (tx / tl) * off
+                    # 横向偏移从「轨迹末端偏移」平滑过渡到「换道目标偏移」，
+                    # 与 S 弯末端无缝衔接（不再从本道 0 偏移重新爬坡）
+                    a = route_wp[max(0, j - 1)]
+                    b = route_wp[min(len(route_wp) - 1, j + 1)]
+                    tx, ty = b.x - a.x, b.y - a.y
+                    tl = math.hypot(tx, ty)
+                    if tl > 1e-6:
+                        blend = min(1.0, max(0.0, (d - d_covered) / 10.0))
+                        off = plan_end_l + (avoid_lat_target - plan_end_l) * blend
+                        px -= (ty / tl) * off
+                        py += (tx / tl) * off
                     ref_path.append({"x": round(px, 1), "y": round(py, 1)})
 
             # 预测轨迹：自行车模型前推 3s（当前车速 + 实际输出前轮角），
@@ -1045,6 +1394,7 @@ def _run_exp10(args):
                     "planned_obstacles": _EXP10_PLANNED_OBSTACLES,
                     "traffic_light": {"state": tl_state, "distance": round(tl_dist, 1)},
                     "avoid": {"active": avoiding, "side": avoid_side, "offset": round(avoid_lat_target, 2)},
+                    "fsm": fsm_state,
                 }
             })
 
@@ -1091,8 +1441,21 @@ def _run_exp10(args):
 
     except Exception as exc:
         _exp_log(f"实验10 异常: {exc}")
+        if _plan_log_f is not None:
+            try:
+                _plan_log(f"EVENT 实验异常: {exc!r}")
+            except Exception:
+                pass
         _push_to_sse({"experiment": {"id": 10, "status": "error", "message": str(exc)}})
     finally:
+        # 规划调试日志收尾：落结束标记后关闭句柄（buffering=1 已逐行落盘）
+        if _plan_log_f is not None:
+            try:
+                _plan_log("=== 实验10 规划调试日志 end ===")
+                _plan_log_f.close()
+            except Exception:
+                pass
+            _plan_log_f = None
         # 清理传感器：先停止监听（断开流），再销毁，避免 socket 报错/scope 警告
         _stream_bird = None
         _stream_camera = None
@@ -1107,6 +1470,10 @@ def _run_exp10(args):
                     if not a.destroy():
                         _exp_log(f"传感器销毁失败 sid={sid}")
                 _sensor_refs.pop(sid, None)
+                # 必须同步从 _managed_actors 移除，否则下次运行 _sweep_stale_actors
+                # 会对已销毁 actor 重复 destroy，触发 CARLA libcarla 原生 Abort
+                with _lock:
+                    _managed_actors.discard(sid)
             except Exception as exc:
                 _exp_log(f"传感器清理异常 sid={sid}: {exc!r}")
         # 清理行人
@@ -1114,6 +1481,8 @@ def _run_exp10(args):
             try:
                 if obj and obj.is_alive:
                     obj.destroy()
+                with _lock:
+                    _managed_actors.discard(obj.id)
             except Exception:
                 pass
         _EXP10_PEDI.clear()
@@ -1122,6 +1491,8 @@ def _run_exp10(args):
             try:
                 if vehicle.is_alive:
                     vehicle.destroy()
+                with _lock:
+                    _managed_actors.discard(vehicle.id)
             except Exception:
                 pass
         # 恢复世界运行模式（同步→原异步），避免残留同步模式导致其他实验卡住

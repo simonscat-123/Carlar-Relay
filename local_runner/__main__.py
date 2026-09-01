@@ -24,7 +24,7 @@ from pathlib import Path
 import pygame
 
 from .charts import TelemetryHistory
-from .fonts import load_font
+from .fonts import clear_font_cache, load_font
 from .relay_client import (
     _PARAMS_DIR,
     _OUTPUT_DIR,
@@ -128,6 +128,9 @@ def _run_experiment(cfg: dict, planner=None) -> int:
         run_meta["plan"] = plan
 
     pygame.init()
+    # 规划阶段可能已 pygame.quit()（map_picker），需清掉失效的字体缓存，防止
+    # 复用已释放 SDL_ttf 资源的 Font 对象导致原生崩溃（黑屏闪退）。
+    clear_font_cache()
     pygame.display.set_caption(f"CARLA 体验仿真 · {cfg['label']} (实验{exp_id}) [ESC 退出]")
     screen = pygame.display.set_mode(WINDOW_SIZE)
     fonts = _make_fonts()
