@@ -599,7 +599,7 @@ def _run_exp10(args):
         T_HORIZON = 4.0        # 轨迹展开时长（s）
         DT_PLAN = 0.25         # 展开步长（s）
         DEC_WIN = 60.0         # 决策窗口：邻道占用/本道被占的检查范围（m）
-        RED_MARGIN = 3.0       # 红灯停止线前的停止余量（沿 s）
+        RED_MARGIN = 0.5       # 红灯停止线前的停止余量（沿 s，停在线前 0.5m）
         STOP_MARGIN = 6.0      # 障碍后缘前的刹停余量（沿 s；前端 safe_distance 滑杆可调）
         COLL_S = 0.5           # 纵向碰撞余量（m）
         COLL_L = 0.3           # 横向碰撞余量（m）
@@ -1073,11 +1073,16 @@ def _run_exp10(args):
             if best is not None:
                 # 由最优候选导出控制量与可视化状态
                 if best["mode"] == "STOP":
+                    # 逼近速度 = 最高速一半（远端），贴近停驻点按舒适制动剖面
+                    # 平滑收敛到 0（desired=√(2·a·d)），停在线前 0.5m
                     d = max(0.1, best["s_stop"] - ego_s)
-                    a_need = v_long * v_long / (2.0 * d)
-                    if v_long < 0.5 and d < 2.0:
-                        a_need = 1.5   # 已近停驻点：保持制动，防止油门分支蠕行越线
-                    desired = 0.0
+                    desired = min(target_speed * 0.5,
+                                  math.sqrt(2.0 * COMFORT_A * d))
+                    if v_long > desired + 0.3 and d > 0.5:
+                        a_need = min(MAX_DECEL,
+                                     (v_long * v_long - desired * desired) / (2.0 * d))
+                    if v_long < 0.5 and d < 1.0:
+                        a_need = max(a_need, 1.5)   # 已到停驻点：保持制动防蠕行
                 else:
                     desired = target_speed
                     if best["s_stop"] < float("inf"):
