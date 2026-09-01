@@ -13,6 +13,7 @@ import math
 
 import pygame
 
+from .fonts import load_font
 from .relay_client import RelayClient, RelayError, decode_frame_b64, img_bytes_to_surface
 
 
@@ -82,7 +83,7 @@ def run(client: RelayClient, params: dict, lanes=None, width=1152, height=720) -
     pygame.init()
     pygame.display.set_caption("综合驾驶 · 鸟瞰规划（左键点选起点→终点，右键重置，ESC 退出）")
     screen = pygame.display.set_mode((width, height))
-    font = pygame.font.SysFont("microsoftyahei", 16)
+    font = load_font(16)
 
     # 世界→屏幕映射（对齐前端 planTransform）：
     # 正方形画区 side=min(W,H)，世界范围取 x 方向 [min_x, max_x]（前端 worldRange 同款）

@@ -13,6 +13,7 @@ import pygame
 
 from local_runner.relay_client import RelayClient, SSEQueue, save_output
 from local_runner.charts import TelemetryHistory
+from local_runner.fonts import load_font
 from local_runner import views
 
 SLUG = sys.argv[1] if len(sys.argv) > 1 else "localization"
@@ -27,7 +28,7 @@ print("relay running:", client.status().get("running"))
 
 pygame.init()
 screen = pygame.display.set_mode((1280, 800))
-fonts = {"sm": pygame.font.SysFont("microsoftyahei", 16), "md": pygame.font.SysFont("microsoftyahei", 20)}
+fonts = {"sm": load_font(16), "md": load_font(20)}
 q = SSEQueue(client)
 q.start()
 hist = TelemetryHistory()

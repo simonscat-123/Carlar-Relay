@@ -24,6 +24,7 @@ from pathlib import Path
 import pygame
 
 from .charts import TelemetryHistory
+from .fonts import load_font
 from .relay_client import (
     _PARAMS_DIR,
     _OUTPUT_DIR,
@@ -63,10 +64,7 @@ def _load_config(slug: str, params_path: str | None) -> dict:
 
 def _make_fonts():
     def f(size, bold=False):
-        try:
-            return pygame.font.SysFont("microsoftyahei", size, bold=bold)
-        except Exception:
-            return pygame.font.Font(None, size)
+        return load_font(size, bold=bold)
     return {"sm": f(16), "md": f(20), "lg": f(26, bold=True)}
 
 
