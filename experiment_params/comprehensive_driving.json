@@ -15,6 +15,7 @@
     "ins_noise": 0.05,
     "alpha": 0.08,
     "sampling_resolution": 2.0,
-    "perception": false
+    "perception": false,
+    "aggressive": true
   }
 }

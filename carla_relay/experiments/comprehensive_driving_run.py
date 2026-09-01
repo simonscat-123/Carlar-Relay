@@ -37,6 +37,11 @@ def _run_exp10(args):
     # 不再查询世界真值；关闭则沿用真值扫描（两种模式可运行中实时切换对比）
     perception_mode = bool(args.get("perception", False))
     _exp_log(f"感知闭环: {'开（bbox 相机单目测距）' if perception_mode else '关（世界真值）'}")
+    # 激进驾驶模式：必经车道被障碍堵死且无同向邻道可绕（单车道/邻接链断裂）时，
+    # 允许借对向车道绕行（逐点地图级校验仍限 Driving 路面，借道期间限速）。
+    # 默认关闭；运行中可经 /experiment/10/params 实时切换
+    aggressive_mode = bool(args.get("aggressive", False))
+    _exp_log(f"激进驾驶: {'开（允许借对向道绕障）' if aggressive_mode else '关（安全模式）'}")
     # 初始化运行中可实时调整的控制参数（前端滑杆可在运行中覆盖）
     with _EXP10_CTRL_LOCK:
         _EXP10_CTRL.clear()
@@ -47,6 +52,7 @@ def _run_exp10(args):
             "steer_delay": steer_delay,
             "brake_force": brake_force,
             "perception": 1.0 if perception_mode else 0.0,
+            "aggressive": 1.0 if aggressive_mode else 0.0,
         })
     gps_failure = bool(args.get("gps_failure", False))
     spawn_pedestrian = bool(args.get("spawn_pedestrian", False))
@@ -84,13 +90,36 @@ def _run_exp10(args):
                 return
             spawn_tf = spawn_pts[start_idx]
         if end_coord:
-            end_loc = carla.Location(x=float(end_coord.get("x", 0)), y=float(end_coord.get("y", 0)), z=0.0)
+            end_loc_raw = carla.Location(x=float(end_coord.get("x", 0)), y=float(end_coord.get("y", 0)), z=0.0)
+            end_tf = _snap(end_loc_raw)
+            end_loc = end_tf.location
         else:
             if end_idx >= len(spawn_pts):
                 _exp_log(f"生成点索引越界: end={end_idx}")
                 _push_to_sse({"experiment": {"id": 10, "status": "error", "message": "spawn idx out of range"}})
                 return
-            end_loc = spawn_pts[end_idx].location
+            end_tf = spawn_pts[end_idx]
+            end_loc = end_tf.location
+
+        # ── 起终点吸附诊断：暴露 road_id/lane_id/yaw，便于排查单行道绕路问题 ──
+        try:
+            _cm = world.get_map()
+            _swp = _cm.get_waypoint(spawn_tf.location, project_to_road=True, lane_type=carla.LaneType.Driving)
+            _ewp = _cm.get_waypoint(end_loc, project_to_road=True, lane_type=carla.LaneType.Driving)
+            _s_snap_d = math.hypot(spawn_tf.location.x - _swp.transform.location.x,
+                                   spawn_tf.location.y - _swp.transform.location.y)
+            _e_snap_d = math.hypot(end_loc_raw.x - _ewp.transform.location.x,
+                                   end_loc_raw.y - _ewp.transform.location.y) if end_coord else 0.0
+            _exp_log(
+                f"起终点吸附: S raw=({_swp.transform.location.x:.1f},{_swp.transform.location.y:.1f}) "
+                f"road={_swp.road_id} lane={_swp.lane_id} sec={_swp.section_id} "
+                f"yaw={_swp.transform.rotation.yaw:.1f}° 吸附偏移={_s_snap_d:.2f}m | "
+                f"E raw=({end_loc.x:.1f},{end_loc.y:.1f}) "
+                f"road={_ewp.road_id} lane={_ewp.lane_id} sec={_ewp.section_id} "
+                f"yaw={_ewp.transform.rotation.yaw:.1f}° 吸附偏移={_e_snap_d:.2f}m"
+            )
+        except Exception as _diag_exc:
+            _exp_log(f"起终点吸附诊断失败: {_diag_exc}")
 
         _exp_log(f"起终点: ({spawn_tf.location.x:.1f}, {spawn_tf.location.y:.1f}) → ({end_loc.x:.1f}, {end_loc.y:.1f}), 直线 {spawn_tf.location.distance(end_loc):.1f} m")
 
@@ -285,6 +314,29 @@ def _run_exp10(args):
             route_lane_ids = [(wp.road_id, wp.lane_id) for wp, _ in path]
             route_wps = [wp for wp, _ in path]   # 保留 waypoint 对象（车道/邻道查询用）
             _exp_log(f"路线规划完成: {len(route_wp)} waypoints")
+
+            # ── 路径端点诊断：暴露第 1/2/倒数 2/1 个 waypoint 的 road/lane/yaw，
+            #    便于判断 GRP 实际是从哪个方向进入/退出端点，排查单向道绕路。──
+            if path:
+                def _wp_info(wp):
+                    return (f"road={wp.road_id} lane={wp.lane_id} "
+                            f"sec={wp.section_id} yaw={wp.transform.rotation.yaw:.1f}° "
+                            f"loc=({wp.transform.location.x:.1f},{wp.transform.location.y:.1f})")
+                n = len(path)
+                head = [_wp_info(path[0][0])]
+                if n > 1:
+                    head.append(_wp_info(path[1][0]))
+                tail = [_wp_info(path[-1][0])]
+                if n > 1:
+                    tail.append(_wp_info(path[-2][0]))
+                _exp_log(f"路径头: { ' ; '.join(head) }")
+                _exp_log(f"路径尾: { ' ; '.join(tail) }")
+                # 路径上 road/lane 切换统计：出现次数 >1 的 road 表示存在折返/绕路
+                from collections import Counter
+                _rd = Counter(wp.road_id for wp, _ in path)
+                _repeat = sorted(((r, c) for r, c in _rd.items() if c > 1), key=lambda x: -x[1])[:5]
+                if _repeat:
+                    _exp_log(f"路径 road 出现次数(>1): {_repeat}")
         except Exception as exc:
             _exp_log(f"路线规划失败({exc})，使用直线插值")
             route_wp = [start_loc, end_loc]
@@ -429,6 +481,23 @@ def _run_exp10(args):
                 tx, ty = b.x - a.x, b.y - a.y
                 f = wp2.transform.get_forward_vector()
                 return (f.x * tx + f.y * ty) > 0.3
+            except Exception:
+                return False
+
+        def _lat_driving(l_t, s_probe):
+            """该偏移点是否落在 Driving 车道上（不限方向——激进借道判定用）。
+            project_to_road 会投影到最近车道，须校验横向距离，
+            防止把远处/邻路的车道投影过来误判为可走。"""
+            try:
+                px, py = _world(s_probe, l_t)
+                wp2 = carla_map.get_waypoint(
+                    carla.Location(x=px, y=py, z=0.0),
+                    project_to_road=True, lane_type=carla.LaneType.Driving)
+                if wp2 is None:
+                    return False
+                dx = wp2.transform.location.x - px
+                dy = wp2.transform.location.y - py
+                return math.hypot(dx, dy) < 1.5
             except Exception:
                 return False
 
@@ -649,6 +718,7 @@ def _run_exp10(args):
         _exp_log(f"规划调试日志: {_plan_log_path}")
         _best_prev_key = None    # 上一帧最优解 (mode, l_t)——切换事件检测
         _tl_state_prev = None    # 上一帧信号灯状态——变化事件检测
+        _borrow_prev = False     # 上一帧是否激进借道——开始/结束事件检测
         _thr_i = 0.0             # 油门积分项（PI 控制的 I，消除坡道/风阻稳态误差）
         _ctl_thr, _ctl_brk = 0.0, 0.0   # 上一帧油门/制动（FRM 日志用，滞后一帧）
 
@@ -679,6 +749,7 @@ def _run_exp10(args):
                 steer_delay = float(_EXP10_CTRL.get("steer_delay", steer_delay))
                 brake_force = float(_EXP10_CTRL.get("brake_force", brake_force))
                 perception_on = float(_EXP10_CTRL.get("perception", 0.0)) > 0.5
+                aggressive_on = float(_EXP10_CTRL.get("aggressive", 0.0)) > 0.5
 
             # 真值
             ego_tf = vehicle.get_transform()
@@ -969,6 +1040,31 @@ def _run_exp10(args):
                     if _obs_stop(l_t) == float("inf"):
                         intent_l = l_t
                         break
+            # 激进模式兜底：本道被占且无同向邻道可绕（单车道+对向道、或邻接链
+            # 断裂致边界收缩）→ 借邻接车道绕行（通常是对向道）。目标偏移取
+            # 邻接车道中心（相对参考线），走廊须无障碍；轨迹层逐点校验仍在
+            # Driving 路面 + 全量碰撞检查 + 借道限速，绕过障碍后自动回本道
+            borrow_l = None
+            if aggressive_on and _blocked and intent_l == 0.0:
+                _wp_b = route_wps[wp_idx] if wp_idx < len(route_wps) else None
+                _b_offs = []
+                if _wp_b is not None:
+                    try:
+                        for nb, sign in ((_wp_b.get_left_lane(), 1.0),
+                                         (_wp_b.get_right_lane(), -1.0)):
+                            if nb is not None and nb.lane_type == carla.LaneType.Driving:
+                                _b_offs.append(sign * (_wp_b.lane_width / 2.0
+                                                        + nb.lane_width / 2.0))
+                    except Exception:
+                        pass
+                if not _b_offs:
+                    _b_offs = [w_lane, -w_lane]
+                for l_t in _b_offs:
+                    if (abs(l_t) > 0.5 and _lat_driving(l_t, ego_s + 12.0)
+                            and _obs_stop(l_t) == float("inf")):
+                        intent_l = l_t
+                        borrow_l = l_t
+                        break
             lat_targets = [0.0] if intent_l == 0.0 else [intent_l, 0.0]
 
             # 候选生成与展开
@@ -977,12 +1073,15 @@ def _run_exp10(args):
             _n_steps = int(T_HORIZON / DT_PLAN)
             T_lat = max(2.0, min(4.0, 1.2 * max(2.0, v_long)))
             for l_t in lat_targets:
+                is_borrow = borrow_l is not None and l_t == borrow_l
+                # 借道限速：绕障机动期间降速通过，缩短对向风险暴露时间
+                v_cap = max(3.0, target_speed * 0.5) if is_borrow else target_speed
                 s_stop = _corridor_stop(l_t)
                 for mode in ("CRUISE", "STOP"):
                     if mode == "STOP" and s_stop == float("inf"):
                         continue   # 无停驻点则无需 STOP 候选
                     if mode == "CRUISE":
-                        a_long = max(-2.0, min(1.5, (target_speed - v_long) / 2.0))
+                        a_long = max(-2.0, min(1.5, (v_cap - v_long) / 2.0))
                     else:
                         d = s_stop - ego_s
                         a_long = 0.0 if d <= 0.5 else max(-MAX_DECEL, -(v_long * v_long) / (2.0 * d))
@@ -1005,7 +1104,7 @@ def _run_exp10(args):
                         v_k = max(v_k, v_prev - MAX_DECEL * DT_PLAN)   # 物理极限内
                         if mode == "CRUISE":
                             if a_long > 0.0:
-                                v_k = min(v_k, target_speed)
+                                v_k = min(v_k, v_cap)
                             if s_stop < float("inf"):
                                 v_k = min(v_k, math.sqrt(
                                     2.0 * COMFORT_A * max(0.0, s_stop - s_prev)))
@@ -1018,8 +1117,16 @@ def _run_exp10(args):
                         s_prev, v_prev = s_k, v_k
                         # 硬约束①：可行驶域（越界即逆行/出路缘，整条拒绝）。
                         # 逐点取「当地」边界——轨迹展开 30m+，前方路段可能收窄/
-                        # 变两车道，只用车头处边界会放行前方的对向车道（蓝线逆行）
-                        if l_min is not None:
+                        # 变两车道，只用车头处边界会放行前方的对向车道（蓝线逆行）。
+                        # 借道候选例外：不受同向域限制，改为逐点地图级校验
+                        # （Driving 路面即可，不限方向）——对向道/邻接链断裂处
+                        # 按此放行，但出路缘仍拒绝
+                        if is_borrow:
+                            if not _lat_driving(l_k, s_k):
+                                _rej_bounds += 1
+                                ok = False
+                                break
+                        elif l_min is not None:
                             b_k = _bounds_at_s(s_k)
                             if b_k is None:
                                 b_k = (l_min, l_max)
@@ -1051,8 +1158,9 @@ def _run_exp10(args):
                         continue
                     # 换道候选：中段与末端落点必须是同向 Driving 车道。
                     # 边界缓存按「邻接链+点积」推断，路口/车道斜接处可能漏判对向
-                    # （如左换道落在交叉来车道上）——地图级查询兜底，逆行零容忍
-                    if abs(dl) > 0.5:
+                    # （如左换道落在交叉来车道上）——地图级查询兜底，逆行零容忍。
+                    # 借道候选（激进模式）显式允许对向，跳过方向校验
+                    if abs(dl) > 0.5 and not is_borrow:
                         if not (_lat_lane_ok(l_t, samples[len(samples) // 2][1])
                                 and _lat_lane_ok(l_t, samples[-1][1])):
                             _rej_dir += 1
@@ -1069,7 +1177,8 @@ def _run_exp10(args):
                             + (0.6 if abs(l_t) > 0.5 else 0.0)
                             + (0.0 if l_t == intent_l else 5.0))
                     cands.append({"cost": cost, "l_t": l_t, "mode": mode,
-                                  "s_stop": s_stop, "a_long": a_long, "samples": samples})
+                                  "s_stop": s_stop, "a_long": a_long,
+                                  "v_cap": v_cap, "samples": samples})
 
             best = min(cands, key=lambda c: c["cost"]) if cands else None
             if best is not None:
@@ -1086,7 +1195,7 @@ def _run_exp10(args):
                     if v_long < 0.5 and d < 1.0:
                         a_need = max(a_need, 1.5)   # 已到停驻点：保持制动防蠕行
                 else:
-                    desired = target_speed
+                    desired = best.get("v_cap", target_speed)
                     if best["s_stop"] < float("inf"):
                         d = max(0.0, best["s_stop"] - ego_s)
                         desired = min(desired, math.sqrt(2.0 * COMFORT_A * d))
@@ -1123,12 +1232,21 @@ def _run_exp10(args):
             if _bk != _best_prev_key:
                 _plan_log(f"EVENT 最优解切换: {_best_prev_key} → {_bk}")
                 _best_prev_key = _bk
+            if (borrow_l is not None) != _borrow_prev:
+                if borrow_l is not None:
+                    _plan_log(f"EVENT 激进借道: 目标偏移 {borrow_l:+.1f}m"
+                              f"（本道被占且无同向邻道可绕）")
+                else:
+                    _plan_log("EVENT 激进借道结束")
+                _borrow_prev = borrow_l is not None
             _obs_str = ",".join(f"{o['s']:.0f}/{o['l']:+.1f}" for o in obstacles[:3])
             _cost_str = f"/c={best['cost']:.2f}" if best is not None else ""
             _plan_log(
                 f"FRM t={t:6.1f} v={spd:5.2f}(lon {v_long:5.2f}) s={ego_s:7.1f} l={ego_l:+5.2f} "
                 f"tl={tl_state[:3]}/{tl_dist:5.1f}m obs={len(obstacles)}[{_obs_str}] "
-                f"blk={'Y' if _blocked else 'N'} itn={intent_l:+5.2f} nb={[round(x, 1) for x in _neighbors]} "
+                f"blk={'Y' if _blocked else 'N'} agm={'Y' if aggressive_on else 'N'} "
+                f"bor={'Y' if borrow_l is not None else 'N'} "
+                f"itn={intent_l:+5.2f} nb={[round(x, 1) for x in _neighbors]} "
                 f"cands={len(cands)} best={_bk[0]}{_cost_str} "
                 f"des={desired:5.2f} a={a_need:5.2f} "
                 f"thr={_ctl_thr:.2f} brk={_ctl_brk:.2f} "
@@ -1146,7 +1264,9 @@ def _run_exp10(args):
                         if nb is not None and nb.lane_type == carla.LaneType.Driving:
                             _cf = _wp_cur.transform.get_forward_vector()
                             _nf = nb.transform.get_forward_vector()
-                            if _nf.x * _cf.x + _nf.y * _cf.y > 0.3:
+                            # 借道期间（激进模式）对向道也高亮，展示实际意图
+                            if (_nf.x * _cf.x + _nf.y * _cf.y > 0.3
+                                    or borrow_l is not None):
                                 avoid_dest_lane = (nb.road_id, nb.lane_id)
                 except Exception:
                     pass
@@ -1166,7 +1286,8 @@ def _run_exp10(args):
                 _fsm_new = "CRUISE"
             # 状态/换道转换日志（教学观测用；CRUISE 回归不刷屏）
             if avoiding and not _avoid_prev:
-                _exp_log(f"{'左' if avoid_side > 0 else '右'}侧邻道可行，换道绕行（目标偏移 {abs(avoid_lat_target):.1f}m）")
+                _exp_log(f"{'左' if avoid_side > 0 else '右'}侧邻道可行，换道绕行（目标偏移 {abs(avoid_lat_target):.1f}m）"
+                         + ("，激进借对向道（限速通过）" if borrow_l is not None else ""))
             elif not avoiding and _avoid_prev:
                 _exp_log("绕行完成，回正车道")
             _avoid_prev = avoiding
@@ -1762,6 +1883,9 @@ def experiment_10_params():
         # 感知闭环开关：运行中实时切换「bbox 相机感知 / 世界真值」，便于 A/B 对比
         if "perception" in data and data["perception"] is not None:
             _EXP10_CTRL["perception"] = 1.0 if bool(data["perception"]) else 0.0
+        # 激进驾驶开关：运行中实时切换「安全模式 / 借对向道绕障」
+        if "aggressive" in data and data["aggressive"] is not None:
+            _EXP10_CTRL["aggressive"] = 1.0 if bool(data["aggressive"]) else 0.0
         snapshot = dict(_EXP10_CTRL)
     return jsonify({"status": "ok", "params": snapshot})
 
