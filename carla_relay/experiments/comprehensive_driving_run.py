@@ -649,6 +649,8 @@ def _run_exp10(args):
         _exp_log(f"规划调试日志: {_plan_log_path}")
         _best_prev_key = None    # 上一帧最优解 (mode, l_t)——切换事件检测
         _tl_state_prev = None    # 上一帧信号灯状态——变化事件检测
+        _thr_i = 0.0             # 油门积分项（PI 控制的 I，消除坡道/风阻稳态误差）
+        _ctl_thr, _ctl_brk = 0.0, 0.0   # 上一帧油门/制动（FRM 日志用，滞后一帧）
 
         while not _EXP10_ABORT:
             world.tick()  # 同步模式：推进一帧，车辆据此移动
@@ -1129,6 +1131,7 @@ def _run_exp10(args):
                 f"blk={'Y' if _blocked else 'N'} itn={intent_l:+5.2f} nb={[round(x, 1) for x in _neighbors]} "
                 f"cands={len(cands)} best={_bk[0]}{_cost_str} "
                 f"des={desired:5.2f} a={a_need:5.2f} "
+                f"thr={_ctl_thr:.2f} brk={_ctl_brk:.2f} "
                 f"rej:域{_rej_bounds}/红{_rej_red}/碰{_rej_coll}/向{_rej_dir}")
 
             # SSE 兼容：换道目标车道（鸟瞰图高亮）。
@@ -1191,12 +1194,17 @@ def _run_exp10(args):
                 desired = min(desired, target_speed * 0.5)
 
             # 施加制动：低于阈值视为无需主动刹车（正常巡航/跟车），否则按所需减速度占比输出
+            # 油门为 PI 控制：纯 P 在坡道/风阻下存在稳态误差（如 target=8 只跑到 5，
+            # 0.25+0.12·err 的油门与阻力平衡），I 项逐帧累积消除余差；制动时 I 衰减防饱和
             COMFORT_D = 0.8
             if a_need > COMFORT_D:
                 brake = min(1.0, max(0.0, (a_need / MAX_DECEL) * brake_force))
+                _thr_i = max(0.0, _thr_i * 0.9)   # 制动期积分衰减（抗饱和）
             else:
                 err = desired - spd
-                throttle = max(0.0, min(1.0, 0.25 + 0.12 * err))
+                _thr_i = max(-0.3, min(0.6, _thr_i + 0.015 * err))
+                throttle = max(0.0, min(1.0, 0.25 + 0.12 * err + _thr_i))
+            _ctl_thr, _ctl_brk = throttle, brake
             speed_history.append(round(spd, 2))
 
             # 横向控制 (Pure Pursuit) —— 前视点改取自「规划轨迹」：
