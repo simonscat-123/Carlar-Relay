@@ -105,7 +105,8 @@ def perception_traffic_lights():
 def _sample_route_obstacles(waypoints, n=3, min_gap=10.0):
     """在导航路线（路点 dict 列表）上随机采样 n 个障碍物位置，任意两个至少相隔 min_gap 米。
     偏移取路线中部（15%~85%），避免与起终点/自车重叠。返回 [{"x","y","z","yaw"},...]；
-    路线过短放不下返回尽量多的点。"""
+    路线过短放不下返回尽量多的点。
+    单车道路段（行驶方向无同向相邻车道，自车无法换道避让）不放障碍，避免堵死自车。"""
     if len(waypoints) < 2:
         return []
     cum = [0.0]
@@ -116,15 +117,6 @@ def _sample_route_obstacles(waypoints, n=3, min_gap=10.0):
     if total < 30:
         return []
     lo, hi = 0.15 * total, 0.85 * total
-    # 多次随机放置，找到满足最小间距的组合；否则退化为等分
-    best = []
-    for _ in range(40):
-        cand = sorted(random.uniform(lo, hi) for _ in range(n))
-        if all(cand[i + 1] - cand[i] >= min_gap for i in range(len(cand) - 1)):
-            best = cand
-            break
-    if not best and hi - lo > 0:
-        best = [lo + (hi - lo) * (i + 1) / (n + 1) for i in range(n)]
 
     def interp(s):
         p = 0
@@ -139,7 +131,46 @@ def _sample_route_obstacles(waypoints, n=3, min_gap=10.0):
                                       waypoints[p + 1]["x"] - waypoints[p]["x"]))
         return {"x": round(x, 2), "y": round(y, 2), "z": round(z, 2), "yaw": round(yaw, 1)}
 
-    return [interp(s) for s in best]
+    # 单车道判定：该位置所在车道若「无同向相邻 Driving 车道」（get_left/right_lane
+    # 要么为空、要么为对向/交叉车道），自车无法换道避让，放置障碍会直接堵死自车
+    # → 跳过不生成（避免阻碍车辆运行）。判定方式与实验10规划的可行驶域扩展一致
+    # （前向点积 >0 才算同向可绕邻道）。
+    def _has_escape(s):
+        pos = interp(s)
+        try:
+            wp = world.get_map().get_waypoint(
+                carla.Location(x=pos["x"], y=pos["y"], z=0.0),
+                project_to_road=True, lane_type=carla.LaneType.Driving)
+            if wp is None:
+                return False
+            cf = wp.transform.get_forward_vector()
+            for nb in (wp.get_left_lane(), wp.get_right_lane()):
+                if nb is not None and nb.lane_type == carla.LaneType.Driving:
+                    nf = nb.transform.get_forward_vector()
+                    if nf.x * cf.x + nf.y * cf.y > 0.0:
+                        return True
+            return False
+        except Exception:
+            return False
+
+    # 路口弧长集合（采样时保持 ≥10m 远离，避免把障碍放到路口及其减速/停车带）
+    junction_s = [cum[i] for i, wp in enumerate(waypoints) if wp.get("is_junction")]
+
+    def _far_from_junction(s):
+        return all(abs(s - js) >= 10.0 for js in junction_s)
+
+    # 多次随机放置，找到「间距达标、非单车道、且离路口≥10m」的组合；
+    # 否则退化为等分后逐点剔除不合格点
+    best = []
+    for _ in range(60):
+        cand = sorted(random.uniform(lo, hi) for _ in range(n))
+        if all(cand[i + 1] - cand[i] >= min_gap for i in range(len(cand) - 1)) \
+                and all(_has_escape(s) and _far_from_junction(s) for s in cand):
+            best = cand
+            break
+    if not best and hi - lo > 0:
+        best = [lo + (hi - lo) * (i + 1) / (n + 1) for i in range(n)]
+    return [interp(s) for s in best if _has_escape(s) and _far_from_junction(s)]
 
 
 @app.route("/route/plan", methods=["POST"])
@@ -167,6 +198,7 @@ def route_plan():
             waypoints.append({
                 "x": round(loc.x, 2), "y": round(loc.y, 2), "z": round(loc.z, 2),
                 "yaw": round(wp.transform.rotation.yaw, 1),
+                "is_junction": bool(wp.is_junction),
             })
             total_len += prev.distance(loc)
             prev = loc

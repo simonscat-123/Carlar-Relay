@@ -1006,6 +1006,11 @@ def _run_exp10(args):
                     l_c = max(lo_b, min(hi_b, l_t))
                     if abs(l_c) < 0.5:
                         continue   # clamp 后已贴回本道，不算可行邻道
+                    # 非激进模式：避让必须开到隔壁车道（全量偏移）。转弯处"蹭着
+                    # 边线"的部分避让幅度不足，易与障碍/路缘擦碰，且本道一旦清空
+                    # 又立刻回摆、反复横跳——宁可跟停也不做无效的部分避让。
+                    if not aggressive_on and abs(l_c) < 0.7 * w_lane:
+                        continue
                     # 前方 12m 处该横向偏移落点必须是同向 Driving 车道（防对向）
                     if not _lat_lane_ok(l_c, ego_s + 12.0):
                         _plan_log(f"EVENT 邻道 {l_c:+.1f}m 被方向校验否决（对向/交叉车道）")
@@ -1072,6 +1077,20 @@ def _run_exp10(args):
             _rej_bounds = _rej_red = _rej_coll = _rej_dir = 0   # 拒绝统计（日志用）
             _n_steps = int(T_HORIZON / DT_PLAN)
             T_lat = max(2.0, min(4.0, 1.2 * max(2.0, v_long)))
+            if intent_l != 0.0:
+                # 避让换道：横向过渡须在抵达障碍前完成（全量进入邻道后再与障碍
+                # 平行）。默认 T_lat 按 1.2·v 拉长（≈21m 才换完），转弯路段横向
+                # 进展又慢，到障碍处只剩 1~2m 偏移，被碰撞硬约束拒掉 → 换道/刹停
+                # 横跳。这里按"障碍前缘距离 / 纵向速度 − 0.8s"压缩过渡时长，
+                # 保证驶到障碍跟前时已全量进入邻道。
+                _obs_front = min((o["s"] - o["half_len"] for o in obstacles
+                                  if o["s"] - o["half_len"] > ego_s + 0.5),
+                                 default=float("inf"))
+                if _obs_front < float("inf"):
+                    _t_avail = max(1.2, (_obs_front - ego_s) / max(1.0, v_long) - 0.8)
+                    T_lat = min(T_lat, _t_avail)
+                else:
+                    T_lat = min(T_lat, 3.0)
             for l_t in lat_targets:
                 is_borrow = borrow_l is not None and l_t == borrow_l
                 # 借道限速：绕障机动期间降速通过，缩短对向风险暴露时间
