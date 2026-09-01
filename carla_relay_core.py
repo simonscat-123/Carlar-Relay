@@ -224,7 +224,6 @@ def _frame_msg(slot: str, sid: Optional[int]) -> Optional[dict]:
 
 def _sse_stream_thread():
     """后台线程：每 50ms 读取全局 _stream_vehicle/_stream_camera，推送给 SSE 订阅者"""
-    _last_spectator_update = 0.0
     while True:
         try:
             # 无订阅者时跳过组包（避免空闲时反复做 base64/JPEG 大包序列化浪费 CPU）
@@ -254,20 +253,6 @@ def _sse_stream_thread():
                         "is_alive": True,
                         "autopilot": _autopilot_state.get(vid, True),
                     }
-                    # 每 0.5 秒让 spectator 镜头跟上车辆
-                    now = time.time()
-                    if now - _last_spectator_update > 0.5:
-                        _last_spectator_update = now
-                        try:
-                            spectator = world.get_spectator()
-                            pt = v.get_transform()
-                            back = pt.get_forward_vector() * -6.0
-                            pt.location += back
-                            pt.location.z += 3.0
-                            pt.rotation.pitch = -14.0
-                            spectator.set_transform(pt)
-                        except Exception:
-                            pass
                 else:
                     msg["vehicle"] = {"id": vid, "is_alive": False}
             # 相机帧（主/前相机）
