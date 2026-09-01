@@ -1,0 +1,134 @@
+{
+ "cases": [
+  {
+   "req": "GET /health",
+   "status": 503,
+   "body": "{\"message\":\"'NoneType' object has no attribute 'get_server_version'\",\"status\":\"error\"}\n"
+  },
+  {
+   "req": "GET /experiments",
+   "status": 200,
+   "body": "{\"experiments\":[]}\n"
+  },
+  {
+   "req": "GET /experiments/1",
+   "status": 404,
+   "body": "{\"message\":\"\\u65e0\\u6548\\u5b9e\\u9a8cID: 1\",\"status\":\"error\"}\n"
+  },
+  {
+   "req": "GET /experiment/status",
+   "status": 200,
+   "body": "{\"experiment_id\":null,\"logs\":[],\"running\":false}\n"
+  },
+  {
+   "req": "GET /experiment/outputs",
+   "status": 200,
+   "body": "{\"files\":[]}\n"
+  },
+  {
+   "req": "GET /perception/obstacles",
+   "status": 400,
+   "body": "{\"message\":\"vehicle_id required\",\"status\":\"error\"}\n"
+  },
+  {
+   "req": "GET /perception/obstacles?vehicle_id=1",
+   "status": 500,
+   "body": "<!doctype html>\n<html lang=en>\n<title>500 Internal Server Error</title>\n<h1>Internal Server Error</h1>\n<p>The server encountered an internal error and was unable to complete your request. Either the s"
+  },
+  {
+   "req": "GET /perception/traffic_lights",
+   "status": 500,
+   "body": "<!doctype html>\n<html lang=en>\n<title>500 Internal Server Error</title>\n<h1>Internal Server Error</h1>\n<p>The server encountered an internal error and was unable to complete your request. Either the s"
+  },
+  {
+   "req": "GET /map/spawn_points",
+   "status": 500,
+   "body": "<!doctype html>\n<html lang=en>\n<title>500 Internal Server Error</title>\n<h1>Internal Server Error</h1>\n<p>The server encountered an internal error and was unable to complete your request. Either the s"
+  },
+  {
+   "req": "GET /map/bounds",
+   "status": 500,
+   "body": "<!doctype html>\n<html lang=en>\n<title>500 Internal Server Error</title>\n<h1>Internal Server Error</h1>\n<p>The server encountered an internal error and was unable to complete your request. Either the s"
+  },
+  {
+   "req": "GET /map/road_network",
+   "status": 500,
+   "body": "<!doctype html>\n<html lang=en>\n<title>500 Internal Server Error</title>\n<h1>Internal Server Error</h1>\n<p>The server encountered an internal error and was unable to complete your request. Either the s"
+  },
+  {
+   "req": "GET /debug/bbox",
+   "status": 200,
+   "body": "{\"instance_raw_keys\":[],\"semantic_raw_keys\":[],\"sensor_dtype\":{},\"sensor_frames_keys\":[],\"stream_bbox\":null}\n"
+  },
+  {
+   "req": "GET /actors",
+   "status": 200,
+   "body": "{\"actors\":[]}\n"
+  },
+  {
+   "req": "GET /vehicle/999/autopilot",
+   "status": 200,
+   "body": "{\"autopilot\":true}\n"
+  },
+  {
+   "req": "GET /sensor/999/frame",
+   "status": 404,
+   "body": "{\"message\":\"no frame yet or sensor not found\",\"status\":\"error\"}\n"
+  },
+  {
+   "req": "POST /experiment/5/level {\"level\": \"L9\"}",
+   "status": 400,
+   "body": "{\"current\":\"L2\",\"message\":\"\\u672a\\u77e5\\u7b49\\u7ea7: L9\",\"status\":\"error\"}\n"
+  },
+  {
+   "req": "POST /experiment/5/level {\"level\": \"L3\"}",
+   "status": 200,
+   "body": "{\"level\":\"L3\",\"message\":\"\\u5df2\\u5207\\u6362\\u5230 L3 \\u8bed\\u4e49\\u5206\\u5272\",\"status\":\"ok\"}\n"
+  },
+  {
+   "req": "POST /experiment/10/params {\"kp_steer\": 0.5, \"perception\": true}",
+   "status": 200,
+   "body": "{\"params\":{\"kp_steer\":0.5,\"perception\":1.0},\"status\":\"ok\"}\n"
+  },
+  {
+   "req": "POST /experiment/1/stop",
+   "status": 200,
+   "body": "{\"message\":\"\\u5b9e\\u9a8c1 \\u505c\\u6b62\\u8bf7\\u6c42\\u5df2\\u53d1\\u9001\",\"status\":\"ok\"}\n"
+  },
+  {
+   "req": "POST /experiment/23/stop",
+   "status": 200,
+   "body": "{\"message\":\"\\u5b9e\\u9a8c23 \\u505c\\u6b62\\u8bf7\\u6c42\\u5df2\\u53d1\\u9001\",\"status\":\"ok\"}\n"
+  },
+  {
+   "req": "POST /experiment/10/stop",
+   "status": 200,
+   "body": "{\"message\":\"\\u5b9e\\u9a8c10 \\u505c\\u6b62\\u8bf7\\u6c42\\u5df2\\u53d1\\u9001\",\"status\":\"ok\"}\n"
+  },
+  {
+   "req": "POST /sync/tick",
+   "status": 500,
+   "body": "<!doctype html>\n<html lang=en>\n<title>500 Internal Server Error</title>\n<h1>Internal Server Error</h1>\n<p>The server encountered an internal error and was unable to complete your request. Either the s"
+  },
+  {
+   "req": "POST /stream/setup {\"camera_sid\": 22, \"vehicle_id\": 11}",
+   "status": 200,
+   "body": "{\"camera_sid\":22,\"status\":\"ok\",\"vehicle_id\":11}\n"
+  },
+  {
+   "req": "DELETE /cleanup",
+   "status": 200,
+   "body": "{\"cleaned\":0,\"status\":\"ok\"}\n"
+  }
+ ],
+ "globals": {
+  "stream_vehicle": null,
+  "stream_camera": null,
+  "semantic_level": "L3",
+  "exp10_ctrl": {
+   "kp_steer": 0.5,
+   "perception": 1.0
+  },
+  "exp_log_tail": []
+ }
+}

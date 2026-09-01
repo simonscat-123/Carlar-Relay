@@ -1,0 +1,11 @@
+{
+  "experiment_id": 5,
+  "label": "语义分割",
+  "slug": "semantic_segmentation",
+  "relay": "http://127.0.0.1:5000",
+  "describe": "多传感器数据的语义分割，按 L2/L3 等级分类目标占比",
+  "params": {
+    "duration": 40,
+    "level": "L2"
+  }
+}

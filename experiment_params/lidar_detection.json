@@ -1,0 +1,17 @@
+{
+  "experiment_id": 4,
+  "label": "Lidar 检测",
+  "slug": "lidar_detection",
+  "relay": "http://127.0.0.1:5000",
+  "describe": "LiDAR 点云采集 + 前向障碍物检测 + 三目画面投影",
+  "params": {
+    "duration": 60,
+    "range": 45,
+    "channels": 64,
+    "points_per_second": 120000,
+    "rotation_frequency": 20,
+    "lidar_hfov": 360,
+    "camera_fov": 90,
+    "npc_count": 3
+  }
+}

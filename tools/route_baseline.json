@@ -1,0 +1,463 @@
+{
+  "mode": "runtime",
+  "target": "X:\\Code\\Carla-Simuilation\\ruiyun-platform\\ui\\usercenter-ui-admin-vben\\apps\\smart-course\\public\\carla_relay_core.py",
+  "count": 65,
+  "routes": [
+    {
+      "rule": "/actors",
+      "methods": [
+        "GET"
+      ],
+      "endpoint": "misc.list_actors"
+    },
+    {
+      "rule": "/cleanup",
+      "methods": [
+        "DELETE"
+      ],
+      "endpoint": "misc.cleanup"
+    },
+    {
+      "rule": "/debug/bbox",
+      "methods": [
+        "GET"
+      ],
+      "endpoint": "misc.debug_bbox"
+    },
+    {
+      "rule": "/experiment/1/start",
+      "methods": [
+        "POST"
+      ],
+      "endpoint": "experiment_1_start"
+    },
+    {
+      "rule": "/experiment/1/stop",
+      "methods": [
+        "POST"
+      ],
+      "endpoint": "experiment_1_stop"
+    },
+    {
+      "rule": "/experiment/10/params",
+      "methods": [
+        "POST"
+      ],
+      "endpoint": "experiment_10_params"
+    },
+    {
+      "rule": "/experiment/10/spawn_obstacle",
+      "methods": [
+        "POST"
+      ],
+      "endpoint": "experiment_10_spawn_obstacle"
+    },
+    {
+      "rule": "/experiment/10/start",
+      "methods": [
+        "POST"
+      ],
+      "endpoint": "experiment_10_start"
+    },
+    {
+      "rule": "/experiment/10/stop",
+      "methods": [
+        "POST"
+      ],
+      "endpoint": "experiment_10_stop"
+    },
+    {
+      "rule": "/experiment/2/start",
+      "methods": [
+        "POST"
+      ],
+      "endpoint": "experiment_2_start"
+    },
+    {
+      "rule": "/experiment/2/stop",
+      "methods": [
+        "POST"
+      ],
+      "endpoint": "experiment_2_stop"
+    },
+    {
+      "rule": "/experiment/23/start",
+      "methods": [
+        "POST"
+      ],
+      "endpoint": "experiment_23_start"
+    },
+    {
+      "rule": "/experiment/23/stop",
+      "methods": [
+        "POST"
+      ],
+      "endpoint": "experiment_23_stop"
+    },
+    {
+      "rule": "/experiment/3/start",
+      "methods": [
+        "POST"
+      ],
+      "endpoint": "experiment_3_start"
+    },
+    {
+      "rule": "/experiment/3/stop",
+      "methods": [
+        "POST"
+      ],
+      "endpoint": "experiment_3_stop"
+    },
+    {
+      "rule": "/experiment/4/start",
+      "methods": [
+        "POST"
+      ],
+      "endpoint": "experiment_4_start"
+    },
+    {
+      "rule": "/experiment/4/stop",
+      "methods": [
+        "POST"
+      ],
+      "endpoint": "experiment_4_stop"
+    },
+    {
+      "rule": "/experiment/5/level",
+      "methods": [
+        "POST"
+      ],
+      "endpoint": "experiment_5_level"
+    },
+    {
+      "rule": "/experiment/5/start",
+      "methods": [
+        "POST"
+      ],
+      "endpoint": "experiment_5_start"
+    },
+    {
+      "rule": "/experiment/5/stop",
+      "methods": [
+        "POST"
+      ],
+      "endpoint": "experiment_5_stop"
+    },
+    {
+      "rule": "/experiment/6/start",
+      "methods": [
+        "POST"
+      ],
+      "endpoint": "experiment_6_start"
+    },
+    {
+      "rule": "/experiment/6/stop",
+      "methods": [
+        "POST"
+      ],
+      "endpoint": "experiment_6_stop"
+    },
+    {
+      "rule": "/experiment/7/start",
+      "methods": [
+        "POST"
+      ],
+      "endpoint": "experiment_7_start"
+    },
+    {
+      "rule": "/experiment/7/stop",
+      "methods": [
+        "POST"
+      ],
+      "endpoint": "experiment_7_stop"
+    },
+    {
+      "rule": "/experiment/8/start",
+      "methods": [
+        "POST"
+      ],
+      "endpoint": "experiment_8_start"
+    },
+    {
+      "rule": "/experiment/8/stop",
+      "methods": [
+        "POST"
+      ],
+      "endpoint": "experiment_8_stop"
+    },
+    {
+      "rule": "/experiment/9/start",
+      "methods": [
+        "POST"
+      ],
+      "endpoint": "experiment_9_start"
+    },
+    {
+      "rule": "/experiment/9/stop",
+      "methods": [
+        "POST"
+      ],
+      "endpoint": "experiment_9_stop"
+    },
+    {
+      "rule": "/experiment/outputs",
+      "methods": [
+        "GET"
+      ],
+      "endpoint": "experiment_outputs"
+    },
+    {
+      "rule": "/experiment/status",
+      "methods": [
+        "GET"
+      ],
+      "endpoint": "experiment_status"
+    },
+    {
+      "rule": "/experiments",
+      "methods": [
+        "GET"
+      ],
+      "endpoint": "list_experiments"
+    },
+    {
+      "rule": "/experiments/<int:exp_id>",
+      "methods": [
+        "GET"
+      ],
+      "endpoint": "get_experiment"
+    },
+    {
+      "rule": "/health",
+      "methods": [
+        "GET"
+      ],
+      "endpoint": "health.health"
+    },
+    {
+      "rule": "/map/bounds",
+      "methods": [
+        "GET"
+      ],
+      "endpoint": "map_bounds"
+    },
+    {
+      "rule": "/map/info",
+      "methods": [
+        "GET"
+      ],
+      "endpoint": "health.map_info"
+    },
+    {
+      "rule": "/map/render",
+      "methods": [
+        "GET"
+      ],
+      "endpoint": "map_render"
+    },
+    {
+      "rule": "/map/road_network",
+      "methods": [
+        "GET"
+      ],
+      "endpoint": "map_road_network"
+    },
+    {
+      "rule": "/map/spawn_points",
+      "methods": [
+        "GET"
+      ],
+      "endpoint": "map_spawn_points"
+    },
+    {
+      "rule": "/pedestrian/spawn",
+      "methods": [
+        "POST"
+      ],
+      "endpoint": "pedestrian_spawn"
+    },
+    {
+      "rule": "/perception/obstacles",
+      "methods": [
+        "GET"
+      ],
+      "endpoint": "perception_obstacles"
+    },
+    {
+      "rule": "/perception/traffic_lights",
+      "methods": [
+        "GET"
+      ],
+      "endpoint": "perception_traffic_lights"
+    },
+    {
+      "rule": "/preview/start",
+      "methods": [
+        "POST"
+      ],
+      "endpoint": "stream.preview_start"
+    },
+    {
+      "rule": "/preview/stop",
+      "methods": [
+        "POST"
+      ],
+      "endpoint": "stream.preview_stop"
+    },
+    {
+      "rule": "/route/plan",
+      "methods": [
+        "POST"
+      ],
+      "endpoint": "route_plan"
+    },
+    {
+      "rule": "/sensor/<int:sid>",
+      "methods": [
+        "DELETE"
+      ],
+      "endpoint": "sensors.sensor_delete"
+    },
+    {
+      "rule": "/sensor/<int:sid>/frame",
+      "methods": [
+        "GET"
+      ],
+      "endpoint": "sensors.sensor_frame"
+    },
+    {
+      "rule": "/stream",
+      "methods": [
+        "GET"
+      ],
+      "endpoint": "stream.stream"
+    },
+    {
+      "rule": "/stream/setup",
+      "methods": [
+        "POST"
+      ],
+      "endpoint": "stream.stream_setup"
+    },
+    {
+      "rule": "/stream/start",
+      "methods": [
+        "POST"
+      ],
+      "endpoint": "stream.stream_start"
+    },
+    {
+      "rule": "/sync/disable",
+      "methods": [
+        "POST"
+      ],
+      "endpoint": "sync.sync_disable"
+    },
+    {
+      "rule": "/sync/enable",
+      "methods": [
+        "POST"
+      ],
+      "endpoint": "sync.sync_enable"
+    },
+    {
+      "rule": "/sync/tick",
+      "methods": [
+        "POST"
+      ],
+      "endpoint": "sync.sync_tick"
+    },
+    {
+      "rule": "/vehicle/<int:vid>",
+      "methods": [
+        "DELETE",
+        "GET"
+      ],
+      "endpoint": "vehicle.vehicle_handle"
+    },
+    {
+      "rule": "/vehicle/<int:vid>/autopilot",
+      "methods": [
+        "GET"
+      ],
+      "endpoint": "vehicle.vehicle_autopilot_get"
+    },
+    {
+      "rule": "/vehicle/<int:vid>/autopilot",
+      "methods": [
+        "POST"
+      ],
+      "endpoint": "vehicle.vehicle_autopilot"
+    },
+    {
+      "rule": "/vehicle/<int:vid>/control",
+      "methods": [
+        "POST"
+      ],
+      "endpoint": "vehicle.vehicle_control"
+    },
+    {
+      "rule": "/vehicle/<int:vid>/sensor/camera",
+      "methods": [
+        "POST"
+      ],
+      "endpoint": "sensors.attach_camera"
+    },
+    {
+      "rule": "/vehicle/<int:vid>/sensor/depth",
+      "methods": [
+        "POST"
+      ],
+      "endpoint": "sensors.attach_depth"
+    },
+    {
+      "rule": "/vehicle/<int:vid>/sensor/gnss",
+      "methods": [
+        "POST"
+      ],
+      "endpoint": "sensors.attach_gnss"
+    },
+    {
+      "rule": "/vehicle/<int:vid>/sensor/imu",
+      "methods": [
+        "POST"
+      ],
+      "endpoint": "sensors.attach_imu"
+    },
+    {
+      "rule": "/vehicle/<int:vid>/sensor/lidar",
+      "methods": [
+        "POST"
+      ],
+      "endpoint": "sensors.attach_lidar"
+    },
+    {
+      "rule": "/vehicle/<int:vid>/sensor/radar",
+      "methods": [
+        "POST"
+      ],
+      "endpoint": "sensors.attach_radar"
+    },
+    {
+      "rule": "/vehicle/<int:vid>/spectator",
+      "methods": [
+        "POST"
+      ],
+      "endpoint": "vehicle.vehicle_spectator"
+    },
+    {
+      "rule": "/vehicle/<int:vid>/spectator/topdown",
+      "methods": [
+        "POST"
+      ],
+      "endpoint": "spectator_topdown"
+    },
+    {
+      "rule": "/vehicle/spawn",
+      "methods": [
+        "POST"
+      ],
+      "endpoint": "vehicle.vehicle_spawn"
+    }
+  ]
+}

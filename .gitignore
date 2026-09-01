@@ -1,0 +1,6 @@
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 实验记录
+output/
