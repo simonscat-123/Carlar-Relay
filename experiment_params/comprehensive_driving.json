@@ -17,6 +17,12 @@
     "sampling_resolution": 2.0,
     "perception": false,
     "aggressive": true,
-    "planner": "simple"
+    "planner": "simple",
+    "controller": "v2",
+    "perceiver": "v2",
+    "tl_stop_margin": 0.5,
+    "tl_brake_window": 30.0,
+    "dec_win": 15.0,
+    "perception_range": 20.0
   }
 }

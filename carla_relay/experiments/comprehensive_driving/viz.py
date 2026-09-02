@@ -146,6 +146,172 @@ def render_bbox_overlay(inst, rgb_raw, instance_raw, perception_on, perceived,
         diag["skip"] += 1
 
 
+# ── 3D 包围框叠加（自车 + 障碍：真实框实线 / 带余量框虚线）─────────────
+# 纯可视化，不改感知/规划/控制。世界系角点 → 相机系 → 像素，透视投影画线框。
+# 目标识别相机：画 8 角点立体线框；鸟瞰相机：画地面足迹(实/虚矩形)。
+# 尺寸/朝向来源：自车=fused 定位 + 车体常量；障碍=Frenet(s,l)→世界 + 类别高度。
+# 余量 = 规划决策用余量 SEP_MIN(横向)/COLL_S(纵向)，所见即决策所用。
+SEP_MIN = 0.2            # 与 simple_planner.SEP_MIN 一致的横向分离余量（m）
+COLL_S = 0.5             # 与 planner.COLL_S 一致的纵向碰撞余量（m）
+EGO_HW = 1.0             # 自车半宽（m）
+EGO_HL = 2.45            # 自车半长（m）
+EGO_H = 1.5              # 自车高（m）
+
+
+def _intrinsics(fov, w, h):
+    focal = w / (2.0 * math.tan(math.radians(fov) / 2.0))
+    return np.array([[focal, 0.0, w / 2.0],
+                     [0.0, focal, h / 2.0],
+                     [0.0, 0.0, 1.0]], dtype=np.float64)
+
+
+def _world_to_camera(vehicle, cam):
+    """世界→相机局部 4x4（同官方 bounding_boxes.py）。
+
+    CARLA 中 attach 到车辆的传感器，get_transform() 返回的已是**世界位姿**
+    （非相对父级的局部位姿），直接取 get_inverse_matrix() 即为 w2c；
+    再叠加车辆变换会重复复合，导致投影全偏出画面。
+    """
+    return np.asarray(cam.get_transform().get_inverse_matrix(), dtype=np.float64)
+
+
+def _project_points(world_pts, vehicle, cam, w, h):
+    """世界系角点 → 像素 (x,y)；点位于相机后方/前方阈值内返回 None。"""
+    K = _intrinsics(float(cam.attributes.get("fov", 90.0)), w, h)
+    w2c = _world_to_camera(vehicle, cam)
+    out = []
+    for p in world_pts:
+        cp = w2c.dot(np.array([p.x, p.y, p.z, 1.0]))
+        # UE4 相机局部系（同官方 get_image_point 的重排 (x,y,z)→(y,-z,x)）：
+        # 前向=+X 为景深分母，+Y 为列方向，-Z 为行方向。
+        z = cp[0]
+        if z <= 0.1:
+            out.append(None)
+            continue
+        px = K[0, 0] * cp[1] / z + K[0, 2]
+        py = K[1, 1] * (-cp[2]) / z + K[1, 2]
+        out.append((px, py))
+    return out
+
+
+def _ego_box_pts(cx, cy, yaw_deg, hl, hw, h_full, ground_z):
+    """自车：中心 + 航向旋转的外接 8 角点（底4+顶4）。"""
+    phi = math.radians(yaw_deg)
+    c, s = math.cos(phi), math.sin(phi)
+    fx, fy, rx, ry = c, s, -s, c
+    def pt(i, j, z):
+        return carla.Location(cx + i * fx + j * rx, cy + i * fy + j * ry, z)
+    bottom = [pt(-hl, -hw, ground_z), pt(-hl, hw, ground_z),
+              pt(hl, hw, ground_z), pt(hl, -hw, ground_z)]
+    top = [carla.Location(p.x, p.y, p.z + h_full) for p in bottom]
+    return bottom, top
+
+
+def _obs_box_pts(ref, o, hl, hw, h_full, ground_z):
+    """障碍：沿参考线在 (s,l) 展开的外接 8 角点（无需航向，world(s,l) 即含方向）。"""
+    s, l = o["s"], o["l"]
+    bottom = []
+    for ds, dl in ((-hl, -hw), (-hl, hw), (hl, hw), (hl, -hw)):
+        x, y = ref.world(s + ds, l + dl)
+        bottom.append(carla.Location(x, y, ground_z))
+    top = [carla.Location(p.x, p.y, p.z + h_full) for p in bottom]
+    return bottom, top
+
+
+_BOX_EDGES = [(0, 1), (1, 2), (2, 3), (3, 0),   # 底框
+              (4, 5), (5, 6), (6, 7), (7, 4),   # 顶框
+              (0, 4), (1, 5), (2, 6), (3, 7)]   # 竖棱
+
+
+def _dashed(draw, a, b, color, width=2, dash=8, gap=5):
+    x0, y0, x1, y1 = a[0], a[1], b[0], b[1]
+    L = math.hypot(x1 - x0, y1 - y0)
+    if L < 1e-6:
+        return
+    ux, uy = (x1 - x0) / L, (y1 - y0) / L
+    d = 0.0
+    while d < L:
+        d2 = min(L, d + dash)
+        draw.line([x0 + ux * d, y0 + uy * d, x0 + ux * d2, y0 + uy * d2],
+                  fill=color, width=width)
+        d = d2 + gap
+
+
+def _draw_box(draw, pixels, color, dashed=False, full3d=True, width=2):
+    """pixels: [8] 像素点。full3d 时画立体线框，否则只画底框足迹。"""
+    edges = _BOX_EDGES if full3d else [(0, 1), (1, 2), (2, 3), (3, 0)]
+    for ia, ib in edges:
+        a, b = pixels[ia], pixels[ib]
+        if a is None or b is None:
+            continue
+        if dashed:
+            _dashed(draw, a, b, color, width=width)
+        else:
+            draw.line([a[0], a[1], b[0], b[1]], fill=color, width=width)
+
+
+_BOX_DBG = {"n": 0}
+
+
+def overlay_3d_boxes(*, vehicle, fused_loc, fused_yaw_deg, obstacles, reference,
+                     inst, bird, sensor_frames, log):
+    """在目标识别相机(inst)与鸟瞰相机(bird)上叠加自车+障碍的 3D/足迹包围框。
+
+    侵入面：仅改写 _sensor_frames[inst.id]/[bird.id] 的编码帧，不动上层决策。
+    obstacles: PercFrame.obstacles（每项含 s/l/half_len/half_w/cls）。
+    """
+    # 无条件入口诊断：证明 overlay 确实被调用、且能看到两个 feed 是否就位
+    if _BOX_DBG["n"] < 6:
+        _BOX_DBG["n"] += 1
+        _has = {c.id: c.id in sensor_frames for c in (inst, bird)}
+        log(f"3DBOX 入口 主车+{len(obstacles)}障碍 "
+            f"inst帧={'在' if _has.get(inst.id) else '无'} "
+            f"bird帧={'在' if _has.get(bird.id) else '无'}")
+
+    ground_z = fused_loc.z - 0.9  # 道路近似高度（自车中心 -0.9 落地）
+    specs = []
+    eb = _ego_box_pts(fused_loc.x, fused_loc.y, fused_yaw_deg, EGO_HL, EGO_HW, EGO_H, ground_z)
+    specs.append({"color": (0, 220, 255), "set": eb})                    # 自车·真实
+    eb_m = _ego_box_pts(fused_loc.x, fused_loc.y, fused_yaw_deg,
+                        EGO_HL + COLL_S, EGO_HW + SEP_MIN, EGO_H, ground_z)
+    specs.append({"color": (0, 120, 255), "set": eb_m, "dashed": True})  # 自车·带余量
+    for o in obstacles:
+        h_full = 1.8 if str(o["cls"]).startswith("walker") else 1.5
+        ob = _obs_box_pts(reference, o, o["half_len"], o["half_w"], h_full, ground_z)
+        specs.append({"color": (255, 180, 0), "set": ob})               # 障碍·真实
+        ob_m = _obs_box_pts(reference, o, o["half_len"] + COLL_S,
+                            o["half_w"] + SEP_MIN, h_full, ground_z)
+        specs.append({"color": (255, 60, 60), "set": ob_m, "dashed": True})  # 障碍·带余量
+
+    for cam, full3d in ((inst, True), (bird, False)):
+        try:
+            jpeg = sensor_frames.get(cam.id)
+            if jpeg is None:
+                continue
+            # 帧可能是被其他渲染改写后的图（如 bbox 叠加把 inst 图换成前相机
+            # 1280x720 的 RGB），故用 jpeg 实际像素尺寸投影，避免内参/画面错配。
+            img = PIL.Image.open(io.BytesIO(jpeg)).convert("RGB")
+            w, h = img.size
+            draw = PIL.ImageDraw.Draw(img)
+            for sp in specs:
+                bottom, top = sp["set"]
+                pts = _project_points(bottom + top, vehicle, cam, w, h)
+                _draw_box(draw, pts, sp["color"], dashed=sp.get("dashed", False),
+                          full3d=full3d)
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=80)
+            sensor_frames[cam.id] = buf.getvalue()
+            # 首个可投影自车框：打印自车底框中心像素，便于确认投影是否落在画面上
+            if _BOX_DBG["n"] < 12:
+                _BOX_DBG["n"] += 1
+                ctr = _project_points([eb[1][2]], vehicle, cam, w, h)[0]
+                log(f"3DBOX cam={str(cam.id)[:6]} 首帧自车框中心像素={ctr} "
+                    f"(画面{w}x{h}) specs={len(specs)} in3d={full3d}")
+        except Exception:
+            import traceback
+            log("3D框渲染异常:\n" + traceback.format_exc())
+
+
 def render_semantic_frame(sem, semantic_raw, sensor_frames, sensor_frame_num,
                           label_semantic_level, colors_from_labels):
     """语义分割帧：原始 CityScapes 标签 → 彩色图写入帧缓存，供 SSE 推流

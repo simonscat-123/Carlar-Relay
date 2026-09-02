@@ -26,11 +26,14 @@ import math
 import carla
 
 from carla_relay.experiments.comprehensive_driving.frames import PlanOutput
+from carla_relay.experiments.comprehensive_driving.params import read
 
 # ── 规划参数（调参入口）──────────────────────────────────────────────────
+# 参数来源登记（key, 默认, 类型, 来源）：来源 JSON=构造注入 params
+# （/start body→_run_exp10(args)）；CONST=本常量兜底默认。
+P_DEC_WIN = ("dec_win", 60.0, float, "JSON")  # 决策窗口：邻道占用/本道被占的检查范围（m）
 T_HORIZON = 4.0        # 轨迹展开时长（s）
 DT_PLAN = 0.25         # 展开步长（s）
-DEC_WIN = 60.0         # 决策窗口：邻道占用/本道被占的检查范围（m）
 RED_MARGIN = 0.5       # 红灯停止线前的停止余量（沿 s，停在线前 0.5m）
 COLL_S = 0.5           # 纵向碰撞余量（m）
 COLL_L = 0.3           # 横向碰撞余量（m）
@@ -61,13 +64,15 @@ INTENT_RETRY_S = 5.0       # 意图失效锁存时长（s），到期重试
 class TrajectoryPlanner:
     """决策 + 时空联合规划器（有状态：意图/借道/FSM 事件检测）。"""
 
-    def __init__(self, ref, predictor, log, plan_log, ego_half_w, ego_half_len):
+    def __init__(self, ref, predictor, log, plan_log, ego_half_w, ego_half_len,
+                 params=None):
         self._ref = ref                  # ReferenceLine
         self._predictor = predictor      # ObstaclePredictor（恒速外推）
         self._log = log                  # _exp_log（SSE 关键事件）
         self._plan_log = plan_log        # 规划调试日志（FRM/EVENT 逐帧细节）
         self._ego_half_w = ego_half_w    # 自车半宽（碰撞检查/走廊判据用）
         self._ego_half_len = ego_half_len  # 自车半长（碰撞检查含障碍长度）
+        self.dec_win = read(params, P_DEC_WIN)  # 决策窗（JSON: dec_win 可覆盖）
         # 事件检测状态（上一帧）
         self._best_prev_key = None       # 上一帧最优解 (mode, l_t)——切换事件检测
         self._borrow_prev = False        # 上一帧是否激进借道——开始/结束事件检测
@@ -119,7 +124,7 @@ class TrajectoryPlanner:
         # ego_l 判走廊会中途判空 → nudge 自取消 → 兜底急刹
         blockers = [o for o in obstacles
                     if abs(o["l"]) < self._ego_half_w + o["half_w"] + 0.25
-                    and ego_s < o["s"] + o["half_len"] < ego_s + DEC_WIN]
+                    and ego_s < o["s"] + o["half_len"] < ego_s + self.dec_win]
         if not blockers:
             return None
         # 动态障碍不贴边：空隙随时间关闭，恒速外推的空隙宽度不可靠
@@ -130,7 +135,7 @@ class TrajectoryPlanner:
         occ = [(o["l"] - o["half_w"] - NUDGE_MARGIN_OBS,
                 o["l"] + o["half_w"] + NUDGE_MARGIN_OBS)
                for o in obstacles
-               if o["s"] - o["half_len"] < ego_s + DEC_WIN
+               if o["s"] - o["half_len"] < ego_s + self.dec_win
                and o["s"] + o["half_len"] > ego_s - 2.0]
         # 本车可用横向边界：取「最近阻挡障碍横截面」处的当地可行驶域（与
         # 逐点硬约束同源），而非自车/前视点处的域——S 弯过渡/前视点跨段时
@@ -301,7 +306,7 @@ class TrajectoryPlanner:
             for o in obstacles:
                 if abs(o["l"] - l_t) < self._ego_half_w + o["half_w"] + 0.25:
                     rear = o["s"] + max(0.0, o["v_s"]) * 1.0 - o["half_len"]
-                    if ego_s + 0.5 < rear < ego_s + DEC_WIN or ego_s + 0.5 < o["s"] + o["half_len"] < ego_s + DEC_WIN:
+                    if ego_s + 0.5 < rear < ego_s + self.dec_win or ego_s + 0.5 < o["s"] + o["half_len"] < ego_s + self.dec_win:
                         s_stop = min(s_stop, rear - STOP_MARGIN)
             return s_stop
 
@@ -803,7 +808,7 @@ class TrajectoryPlanner:
         # 行为状态标签（教学/日志/可视化用；决策本身每帧重估无状态依赖）
         _blocked_now = any(
             abs(o["l"] - ego_l) < self._ego_half_w + o["half_w"] + 0.25
-            and ego_s < o["s"] + o["half_len"] < ego_s + DEC_WIN
+            and ego_s < o["s"] + o["half_len"] < ego_s + self.dec_win
             for o in obstacles)
         if _best_nudge:
             _fsm_new = "NUDGE"
@@ -844,9 +849,12 @@ class TrajectoryPlanner:
                     front_obstacle = d_rear
                     front_obs_src = o["cls"]
 
-        # 黄灯：软约束（红灯/障碍已由规划层硬约束处理，此处不叠加）
+        # 黄灯：软约束兜底——仅当感知层未提供黄灯停驻点时生效（perception_v2
+        # 红/黄统一输出停驻点，走上方常规停驻剖面；legacy 感知黄灯无停驻点，
+        # 保留旧行为）
         YELLOW_D = 1.0
-        if tl_state == "yellow" and a_need < YELLOW_D:
+        if (tl_state == "yellow" and red_stop_s is None
+                and a_need < YELLOW_D):
             a_need = YELLOW_D
             desired = min(desired, target_speed * 0.5)
 

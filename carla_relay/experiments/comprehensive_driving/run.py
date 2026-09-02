@@ -28,6 +28,7 @@ from carla_relay.experiments.comprehensive_driving.reference import ReferenceLin
 from carla_relay.experiments.comprehensive_driving.sensor import SensorRig
 from carla_relay.experiments.comprehensive_driving.localization import Localizer
 from carla_relay.experiments.comprehensive_driving.perception import Perceiver
+from carla_relay.experiments.comprehensive_driving.perception_v2 import PerceiverV2
 from carla_relay.experiments.comprehensive_driving.prediction import ObstaclePredictor
 from carla_relay.experiments.comprehensive_driving.planner import (
     TrajectoryPlanner, RED_MARGIN, MAX_DECEL,
@@ -36,8 +37,10 @@ from carla_relay.experiments.comprehensive_driving.simple_planner import (
     SimplePlanner,
 )
 from carla_relay.experiments.comprehensive_driving.control import VehicleController
+from carla_relay.experiments.comprehensive_driving.control_v2 import VehicleControllerV2
 from carla_relay.experiments.comprehensive_driving.viz import (
     render_bbox_overlay, render_semantic_frame, build_sse_payload,
+    overlay_3d_boxes,
 )
 from carla_relay.experiments.comprehensive_driving.actors import (
     spawn_obstacle_ahead, refresh_route_obstacles, clear_obstacles,
@@ -120,6 +123,31 @@ def _run_exp10(args):
         planner_kind = "legacy"
     _exp_log(f"规划器: {planner_kind}"
              f"{'（单一几何避障）' if planner_kind == 'simple' else '（FSM+采样式规划）'}")
+    # 控制器选择：v2=前馈+反馈纵向（无油门基线，停车保持归控制层）；
+    # legacy=0.25 基线油门 + 纯前馈制动（保持旧行为，默认）
+    controller_kind = str(args.get("controller", "legacy")).lower()
+    if controller_kind not in ("v2", "legacy"):
+        controller_kind = "legacy"
+    _exp_log(f"控制器: {controller_kind}"
+             f"{'（前馈+反馈纵向）' if controller_kind == 'v2' else '（基线油门+前馈制动）'}")
+    # 感知器（信号灯判定）选择：v2=车道归属+路口committed+越线判定，红/黄
+    # 统一停驻点（修：黄灯不停/红灯蠕行闯灯/停在路中间等驶入车道的灯）；
+    # legacy=旧判定（保持旧行为，默认）
+    perceiver_kind = str(args.get("perceiver", "legacy")).lower()
+    if perceiver_kind not in ("v2", "legacy"):
+        perceiver_kind = "legacy"
+    _exp_log(f"感知器: {perceiver_kind}"
+             f"{'（车道归属+红黄统一停驻）' if perceiver_kind == 'v2' else '（旧信号灯判定）'}")
+    # 信号灯参数（v2 感知用）：停止余量 / 刹停考虑窗口
+    tl_stop_margin = float(args.get("tl_stop_margin", RED_MARGIN))
+    tl_brake_window = float(args.get("tl_brake_window", 80.0))
+    # 规划/感知可调参数（JSON 覆盖，缺省按各消费层模块头登记默认；构造时注入 params：
+    # simple_planner 避障窗 dec_win=15；legacy 规划器决策窗 dec_win=60；感知距离=50）
+    exp_params = {
+        "dec_win": float(args.get("dec_win",
+                                  15.0 if planner_kind == "simple" else 60.0)),
+        "perception_range": float(args.get("perception_range", 50.0)),
+    }
     gps_failure = bool(args.get("gps_failure", False))
     spawn_pedestrian = bool(args.get("spawn_pedestrian", False))
     sampling_res = float(args.get("sampling_resolution", 2.0))
@@ -332,6 +360,14 @@ def _run_exp10(args):
             except Exception:
                 pass
 
+        def _both_log(msg):
+            """诊断日志：同时落地到规划日志文件 + SSE 实时日志面板。"""
+            _plan_log(msg)
+            try:
+                _exp_log(msg)
+            except Exception:
+                pass
+
         _plan_log(f"=== 实验10 规划调试日志 start ===")
         _plan_log(f"参数: target={target_speed} lookahead={lookahead} kp={kp_steer} "
                   f"safe_dist={safe_dist} brake_force={brake_force} "
@@ -343,16 +379,28 @@ def _run_exp10(args):
         # ── 各层实例（依赖经构造函数显式注入；层间数据经帧契约流动）──
         localizer = Localizer(gnss_noise, ins_noise, alpha, vehicle.get_location())
         predictor = ObstaclePredictor()
-        perceiver = Perceiver(reference, world, carla_map, _exp_log, _dynamic_class,
-                              RED_MARGIN, tl_bindings, _TL_STATE_MAP, _plan_log)
+        if perceiver_kind == "v2":
+            # v2 感知：自带绑定（含车道归属），tl_stop_margin/窗口参数化
+            perceiver = PerceiverV2(reference, world, carla_map, _exp_log,
+                                    _dynamic_class, tl_stop_margin,
+                                    tl_brake_window, _TL_STATE_MAP, _plan_log,
+                                    route_lane_ids, params=exp_params)
+        else:
+            perceiver = Perceiver(reference, world, carla_map, _exp_log,
+                                  _dynamic_class, RED_MARGIN, tl_bindings,
+                                  _TL_STATE_MAP, _plan_log, params=exp_params)
         if planner_kind == "simple":
             planner = SimplePlanner(reference, predictor, _exp_log, _plan_log,
-                                    ego_half_w, ego_half_len)
+                                    ego_half_w, ego_half_len, params=exp_params)
         else:
             planner = TrajectoryPlanner(reference, predictor, _exp_log, _plan_log,
-                                        ego_half_w, ego_half_len)
-        controller = VehicleController(kp_steer, lookahead, steer_delay,
-                                       brake_force, MAX_DECEL)
+                                        ego_half_w, ego_half_len, params=exp_params)
+        if controller_kind == "v2":
+            controller = VehicleControllerV2(kp_steer, lookahead, steer_delay,
+                                             brake_force, MAX_DECEL)
+        else:
+            controller = VehicleController(kp_steer, lookahead, steer_delay,
+                                           brake_force, MAX_DECEL)
 
         # 装配上下文（调试时可整体检视各层实例与装配产物）
         ctx = Exp10Context()
@@ -374,7 +422,7 @@ def _run_exp10(args):
         ctx.carla_map = carla_map
         ctx.sensors = (cam, inst, sem, bird, lidar, gnss, imu, col)
         ctx.reference = reference
-        ctx.tl_bindings = tl_bindings
+        ctx.tl_bindings = getattr(perceiver, "bindings", tl_bindings)
         ctx.rig = rig
         ctx.localizer = localizer
         ctx.perceiver = perceiver
@@ -387,7 +435,11 @@ def _run_exp10(args):
             "safe_dist": safe_dist, "gnss_noise": gnss_noise, "ins_noise": ins_noise,
             "alpha": alpha, "perception": perception_mode, "aggressive": aggressive_mode,
             "gps_failure": gps_failure, "sampling_res": sampling_res,
+            "dec_win": exp_params["dec_win"],
+            "perception_range": exp_params["perception_range"],
             "planner": planner_kind,
+            "controller": controller_kind,
+            "perceiver": perceiver_kind,
         }
 
         # 7. 主循环（编排：tick → 定位 → 感知 → 规划 → 控制 → 可视化/推送）
@@ -498,6 +550,14 @@ def _run_exp10(args):
                                 perc.perceived, perc.bbox_cands,
                                 _sensor_frames, _sensor_frame_num, _bbox_diag, _exp_log)
 
+            # 目标识别相机 + 鸟瞰相机：叠加自车/障碍的 3D 包围框（真实框实线、
+            # 带余量框虚线，余量=SEP_MIN/COLL_S）。纯可视化，不改决策逻辑。
+            overlay_3d_boxes(vehicle=vehicle, fused_loc=loc.fused_loc,
+                             fused_yaw_deg=loc.fused_yaw_deg,
+                             obstacles=perc.obstacles, reference=reference,
+                             inst=inst, bird=bird, sensor_frames=_sensor_frames,
+                             log=_both_log)
+
             # 车速 + Frenet 位姿（先于红绿灯判定与决策规划，供同帧使用）
             vel = vehicle.get_velocity()
             spd = math.sqrt(vel.x ** 2 + vel.y ** 2)
@@ -506,7 +566,15 @@ def _run_exp10(args):
             v_long = max(0.0, vel.x * ego_tx + vel.y * ego_ty)   # 纵向车速（沿参考线）
 
             # ── 感知层：信号灯状态（停止线绑定 + s 判定，输出 TlFrame）──
-            tl = perceiver.read_traffic_light(ego_s)
+            # v2：车道归属 + 路口 committed（自车已在路口内则穿行到底）
+            if perceiver_kind == "v2":
+                _wp_ego = (route_wps[wp_idx]
+                           if wp_idx < len(route_wps) else None)
+                tl = perceiver.read_traffic_light(
+                    ego_s, wp_idx,
+                    _wp_ego is not None and _wp_ego.is_junction)
+            else:
+                tl = perceiver.read_traffic_light(ego_s)
 
             # ── 规划层：决策 + 时空联合规划（输出 PlanOutput：轨迹 + 期望 + 可视化状态）──
             # 航向-参考线夹角（日志增强#5）：自车航向 vs 参考线切向。拐点重关联
@@ -529,6 +597,29 @@ def _run_exp10(args):
                 loc=loc.fused_loc, yaw_rad=math.radians(loc.fused_yaw_deg),
                 plan_traj=plan.plan_traj, route_wp=route_wp, wp_idx=wp_idx)
             wp_idx = ctrl.wp_idx
+
+            # ── 横向链路诊断（方向C）：命令 l_t 是否写进轨迹、控制有没有在跟 ──
+            # 取「距自车 ≥ lookahead 的第一个规划轨迹点」反投影到 Frenet，得到该点被
+            # 命令的横向 cmd_l。与实姿 ego_l 对比即可定位断点：
+            #   cmd_l≈+2.2 而 ego_l≈0.5 → 轨迹带了偏移但执行没跟（控制/执行侧）；
+            #   cmd_l≈0（尽管 intent_l=+2.2）→ 轨迹本身没写进偏移（规划侧）。
+            # 仅在绕行/偏移目标非零时逐帧写规划调试日志，巡航不刷屏。
+            _cmd_l = None
+            _cmd_s = None
+            if plan.avoiding or abs(plan.intent_l) > 1e-6:
+                for _px, _py in plan.plan_traj:
+                    if math.hypot(_px - loc.fused_loc.x, _py - loc.fused_loc.y) >= lookahead:
+                        try:
+                            _cmd_s, _cmd_l, *_ = reference.frenet(
+                                _px, _py, _scan_j0, _scan_j1, track=True)
+                        except Exception:
+                            _cmd_l = None
+                        break
+                _plan_log(f"LAT t={t:.1f} intent_l={plan.intent_l:+.2f} "
+                          + (f"cmd_l={_cmd_l:+.2f}@s{_cmd_s:.0f} ego_l={ego_l:+.2f} "
+                             f"steer={ctrl.steer:.2f} raw={ctrl.raw_steer:.2f} "
+                             f"cte={ctrl.cte:.2f} spd={spd:.2f}"
+                             if _cmd_l is not None else "cmd_l=NA"))
 
             # 应用控制
             vehicle.apply_control(carla.VehicleControl(

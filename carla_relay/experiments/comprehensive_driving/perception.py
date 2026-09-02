@@ -6,9 +6,10 @@
     接地点针孔模型单目测距 + 像素方位角（不查询任何世界真值）；
   - Perceiver.step：双模式障碍扫描——
       感知闭环（perception_on）：只来自 bbox 相机，视野限制即真实限制
-      （FOV ±45°、约 50m）；由感知结果反算世界坐标（基准=融合定位），
-      再用 HD Map 做车道归属，与真实系统一致；
-      世界真值模式：全量扫描 50m 内车辆/行人（含包围盒尺寸/实测速度）。
+      （FOV ±45°、识别距离上限 perception_range）；由感知结果反算世界
+      坐标（基准=融合定位），再用 HD Map 做车道归属，与真实系统一致；
+      世界真值模式：全量扫描 perception_range 内车辆/行人（含包围盒
+      尺寸/实测速度）。
     输出统一 Frenet 障碍列表（全量保留不预筛选本道——筛选交给规划器的
     碰撞检查，旁道/远端障碍天然进入时空联合检查）。
   - Perceiver.read_traffic_light：读取绑定到本路线的信号灯当前灯色
@@ -25,6 +26,13 @@ import carla
 import numpy as np
 
 from carla_relay.experiments.comprehensive_driving.frames import PercFrame, TlFrame
+from carla_relay.experiments.comprehensive_driving.params import read
+
+# ── 感知识别范围（识别距离上限）────────────────────────────────────────
+# 参数来源登记（key, 默认, 类型, 来源）；来源 JSON=构造注入 params
+# （/start body→_run_exp10(args)）。两种模式统一封顶：真值扫描 /
+# bbox 单目感知（perception_on）。
+P_PERC_RANGE = ("perception_range", 50.0, float, "JSON")  # 障碍识别距离上限（m）
 
 # ── bbox 相机（参照官方示例 PythonAPI/examples/bounding_boxes.py）─────────────
 # CARLA 语义标签 → (类别名, 框颜色)。颜色沿用官方 SEMANTIC_MAP（CityScapes 调色板），
@@ -156,7 +164,7 @@ class Perceiver:
     """感知层：每 tick 扫描障碍（相机闭环 / 世界真值）+ 读取信号灯状态。"""
 
     def __init__(self, ref, world, carla_map, log, dynamic_class, red_margin,
-                 tl_bindings, tl_state_map, plan_log):
+                 tl_bindings, tl_state_map, plan_log, params=None):
         self._ref = ref                    # ReferenceLine（Frenet/地图查询）
         self._world = world                # CARLA world（真值模式 actor 扫描用）
         self._carla_map = carla_map
@@ -166,6 +174,7 @@ class Perceiver:
         self._tl_bindings = tl_bindings    # 参考线停止线绑定（装配期一次性）
         self._tl_state_map = tl_state_map
         self._plan_log = plan_log          # 规划调试日志（EVENT 信号灯变化）
+        self._perc_range = read(params, P_PERC_RANGE)  # 识别距离上限（JSON: perception_range 可覆盖）
         self._diag = {"err": 0}            # 相机感知异常诊断计数
         self._tl_state_prev = None         # 上一帧信号灯状态——变化事件检测
 
@@ -174,14 +183,14 @@ class Perceiver:
         """障碍统一扫描：全量保留（不预筛选本道），输出 Frenet 障碍列表。
         每个障碍含半长/半宽（修"距离只算到障碍中心"的问题）。"""
         obstacles = []            # 统一障碍列表：[{s,l,half_len,half_w,v_s,lane,cls,id}]
-        bbox_cands = []           # 包围框相机候选：50m 内的车辆/行人 (actor, 距离)
+        bbox_cands = []           # 包围框相机候选：perception_range 内的车辆/行人 (actor, 距离)
         perceived = []            # 感知闭环：bbox 相机单目感知到的障碍物
         fwd = ego_tf.get_forward_vector()
         left = carla.Vector3D(x=fwd.y, y=-fwd.x, z=0)  # 车体系左向（lat 左正约定；(-fwd.y,fwd.x) 是右向，曾致感知坐标镜像）
 
         if perception_on:
             # ── 感知闭环：不查询世界真值，障碍物只来自 bbox 相机（实例+语义）──
-            # 视野限制即真实限制：FOV ±45°、约 50m 内的目标才能被"看见"
+            # 视野限制即真实限制：FOV ±45°、识别距离上限 perception_range 内的目标才能被"看见"
             try:
                 if inst.id in instance_raw and sem.id in semantic_raw:
                     ih = int(inst.attributes["image_size_y"])
@@ -197,6 +206,8 @@ class Perceiver:
                     self._log(f"相机感知异常#{self._diag['err']}: {exc!r}")
             obs_list = []
             for p in perceived:
+                if p["dist"] > self._perc_range:
+                    continue   # 超过识别距离上限（perception_range，本车太远不可信）
                 fwd_dist, lat = p["fwd"], p["lat"]
                 # 由感知结果反算世界坐标（基准=融合定位；再用 HD Map 做车道归属），
                 # 与真实系统一致：相机检测目标 → 地图匹配 → 车道级行为决策
@@ -233,7 +244,7 @@ class Perceiver:
                 if not (tid.startswith("vehicle.") or tid.startswith("walker.")):
                     continue
                 dist = actor.get_location().distance(fused_loc)
-                if dist > 50:
+                if dist > self._perc_range:
                     continue
                 vel = actor.get_velocity()
                 speed = math.sqrt(vel.x ** 2 + vel.y ** 2)

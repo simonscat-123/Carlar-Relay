@@ -31,9 +31,12 @@ import math
 import carla
 
 from carla_relay.experiments.comprehensive_driving.frames import PlanOutput
+from carla_relay.experiments.comprehensive_driving.params import read
 
-# ── 参数（刻意保持少量）───────────────────────────────────────────────────
-DEC_WIN = 60.0        # 前方阻挡障碍检查范围（m）
+# ── 参数来源登记（key, 默认, 类型, 来源, 说明）────────────────────────────
+# 来源: JSON=构造注入 params（/start body→_run_exp10(args)）
+#       CONST=模块级硬编码兜底默认。正文刻意保持少量可调量。
+P_DEC_WIN = ("dec_win", 15.0, float, "JSON")  # 前方阻挡障碍检查范围（m）
 AVOID_MARGIN = 1.0    # 单一横向余量（m）：障碍边 → 本车边（含执行层跟踪误差预算）
 EDGE_MARGIN = 0.3     # 域边界余量（m）：本车边 → 可行驶域边界
 SEP_MIN = 0.2         # 碰撞安全网的最小横向分离（m）
@@ -54,13 +57,15 @@ POSE_WIN_AHEAD = 6.0  # 实际位姿安全网：纵向刹停窗口下限（m）
 class SimplePlanner:
     """单一几何避障规划器（每帧重估，近零状态：仅事件日志用上一帧标记）。"""
 
-    def __init__(self, ref, predictor, log, plan_log, ego_half_w, ego_half_len):
+    def __init__(self, ref, predictor, log, plan_log, ego_half_w, ego_half_len,
+                 params=None):
         self._ref = ref                  # ReferenceLine
         self._predictor = predictor      # ObstaclePredictor（恒速外推，安全网用）
         self._log = log                  # _exp_log（SSE 关键事件）
         self._plan_log = plan_log        # 规划调试日志
         self._ego_half_w = ego_half_w
         self._ego_half_len = ego_half_len
+        self.dec_win = read(params, P_DEC_WIN)  # 避障窗（JSON: dec_win 可覆盖）
         self._avoid_prev = False         # 上一帧是否绕行中（开始/结束事件）
         self._fsm_state = "CRUISE"       # 展示标签，无决策依赖
 
@@ -98,7 +103,7 @@ class SimplePlanner:
         for o in obstacles:
             if ego_s + 0.5 >= o["s"] + o["half_len"]:
                 continue   # 已越过（车头已过障碍后缘）
-            if o["s"] - o["half_len"] > ego_s + DEC_WIN:
+            if o["s"] - o["half_len"] > ego_s + self.dec_win:
                 continue   # 决策窗外
             if abs(o["l"]) < self._ego_half_w + o["half_w"] + 0.25:
                 out.append(o)
@@ -188,11 +193,28 @@ class SimplePlanner:
                 # 注：不做「目标≈当前偏移则跳过」判断（实测 20260902_165209
                 # 会误杀唯一可行侧致逐帧翻转）；已到位且校验通过 = 稳定保持
                 # 偏移直到越过包络。某侧贴回被占区间由分离校验否决。
+                rej = []
                 for l_t, side in cands:
-                    if self._try_side(l_t, blockers, s_mid, aggressive_on):
+                    sep_ok = all(
+                        abs(l_t - o["l"]) >= self._ego_half_w + o["half_w"] + SEP_MIN
+                        for o in blockers)
+                    if aggressive_on:
+                        driving = self._ref.lat_driving(l_t, s_mid)
+                    else:
+                        driving = self._ref.lat_driving_fwd(l_t, s_mid)
+                    if sep_ok and driving:
                         avoid_l = l_t
                         avoid_side = side
                         break
+                    rej.append(f"{l_t:+.2f}/{('sep' if not sep_ok else 'map'):3s}{driving}")
+                # 候选全部被拒 → 逐帧落 DISC 诊断，定位「地形真没空间 vs 判定误杀」
+                if avoid_l is None and cands:
+                    _sre = min(o["s"] - o["half_len"] for o in blockers)
+                    _ivs = ",".join(f"[{a:.1f},{b:.1f}]" for a, b in
+                                    self._probe_drivable(s_mid, aggressive_on))
+                    plan_log(f"DISC t={t:.1f} 候选全拒 s_mid={s_mid:.1f} "
+                             f"dwn={_sre - ego_s:.1f} agg={int(aggressive_on)} "
+                             f"ivs={_ivs} cands={' '.join(rej)}")
             if avoid_l is None:
                 avoid_reason = "无可行驶侧或地图校验否决"
         elif blockers:
@@ -395,17 +417,27 @@ class SimplePlanner:
                     front_obstacle = d_rear
                     front_obs_src = o["cls"]
 
-        # 黄灯软约束（红灯/障碍已由纵向逻辑处理）
-        if tl_state == "yellow" and a_need < 1.0:
+        # 黄灯软约束兜底——仅当感知层未提供黄灯停驻点时生效（perception_v2
+        # 红/黄统一输出停驻点，走上方常规停驻剖面；legacy 保留旧行为）
+        if (tl_state == "yellow" and red_stop_s is None
+                and a_need < 1.0):
             a_need = 1.0
             desired = min(desired, target_speed * 0.5)
 
         # 逐帧一行调试日志（与 legacy FRM 行同位，便于 A/B 对比）
         _obs_str = ",".join(f"{o['s']:.0f}/{o['l']:+.1f}" for o in obstacles[:3])
+        # dec_win 越窗诊断：最近 blocker 后缘距 ego 的 s 余量；>dec_win 说明
+        # 该 blocker 本应被 _blockers() 排除（跑的代码可能与注入的 dec_win 不一致）
+        _blk_margin = ""
+        if blockers:
+            _min_back = min(o["s"] - o["half_len"] - ego_s for o in blockers)
+            _blk_margin = (f" dwn={_min_back:+5.1f}"
+                           + (" !DECWIN" if _min_back > self.dec_win else ""))
         plan_log(
             f"FRM t={t:6.1f} v={spd:5.2f}(lon {v_long:5.2f}) s={ego_s:7.1f} l={ego_l:+5.2f} "
             f"wp={wp_idx} tl={tl_state[:3]}/{tl_dist:5.1f}m obs={len(obstacles)}[{_obs_str}] "
-            f"blk={len(blockers)} agm={'Y' if aggressive_on else 'N'} "
+            f"blk={len(blockers)}#{len(blockers) and min(o['s'] for o in blockers):.0f}{_blk_margin} "
+            f"agm={'Y' if aggressive_on else 'N'} "
             f"l_t={avoid_l if avoid_l is not None else 0.0:+5.2f} "
             f"des={desired:5.2f} a={a_need:5.2f} thr={prev_thr:.2f} brk={prev_brk:.2f} "
             f"fsm={self._fsm_state})")
