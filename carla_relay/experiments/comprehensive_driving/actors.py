@@ -21,6 +21,10 @@ import random
 import carla
 import numpy as np
 
+# ── 障碍物生成参数（调参入口）─────────────────────────────────────────────
+SPAWN_RETRY_OFFSETS = (0.0, 1.5, -1.5, 3.0, -3.0)  # 原位生成失败时沿路线方向前后微调重试的偏移序列（m）
+OBSTACLE_DISPLACED_TOL = 3.0    # 障碍物被撞离原位判定阈值（m）：超过视为缺失，销毁后按原位置重生成
+
 
 def spawn_obstacle_ahead(world, ego, route, distance, managed_actors, lock):
     """在 ego 沿路线前方 distance 米处生成静止障碍车辆。
@@ -112,8 +116,8 @@ def spawn_route_obstacles(world, positions, log, managed_actors, lock):
             break
         yaw = math.radians(obc.get("yaw", 0))
         z = obc.get("z", 0)
-        # 原位 → 沿路线前后 ±1~4m 依次重试（生成点蹭到护栏/路缘时微调即可成功）
-        offsets = (0.0, 1.5, -1.5, 3.0, -3.0)
+        # 原位 → 沿路线前后按 SPAWN_RETRY_OFFSETS 依次重试（生成点蹭到护栏/路缘时微调即可成功）
+        offsets = SPAWN_RETRY_OFFSETS
         obs = None
         used = None
         for ds in offsets:
@@ -210,7 +214,7 @@ def refresh_route_obstacles(world, need_fresh, planned_obstacles, obstacle_actor
             # 不在路线上的障碍没有避障意义，销毁后按原规划位置重生成
             disp = math.hypot(a.get_location().x - ent["pos"]["x"],
                               a.get_location().y - ent["pos"]["y"])
-            if disp <= 3.0:
+            if disp <= OBSTACLE_DISPLACED_TOL:
                 alive.append(ent)
             else:
                 log(f"检测到障碍物被撞离原位 {disp:.1f}m，按原位置重生成")

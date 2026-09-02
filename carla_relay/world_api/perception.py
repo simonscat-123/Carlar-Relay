@@ -102,9 +102,16 @@ def perception_traffic_lights():
 
 # --- 规划：全局路线 ---
 
-def _sample_route_obstacles(waypoints, n=3, min_gap=10.0):
+# ── 路线障碍物采样参数（调参入口）─────────────────────────────────────────
+OBSTACLE_COUNT = 4              # 每条路线规划的障碍物数量（个）
+OBSTACLE_MIN_GAP = 7.0         # 障碍物之间的最小间距（m）
+OBSTACLE_RANGE = (0.1, 0.9)   # 采样范围（占路线全长比例，避开起终点/自车）
+OBSTACLE_MIN_ROUTE_LEN = 30.0   # 路线最短长度（m）：短于此不放置障碍
+OBSTACLE_JUNCTION_CLEAR = 5.0  # 障碍物距路口的最小距离（m，避开减速/停车带）
+
+def _sample_route_obstacles(waypoints, n=OBSTACLE_COUNT, min_gap=OBSTACLE_MIN_GAP):
     """在导航路线（路点 dict 列表）上随机采样 n 个障碍物位置，任意两个至少相隔 min_gap 米。
-    偏移取路线中部（15%~85%），避免与起终点/自车重叠。返回 [{"x","y","z","yaw"},...]；
+    偏移取路线中部（OBSTACLE_RANGE 比例区间），避免与起终点/自车重叠。返回 [{"x","y","z","yaw"},...]；
     路线过短放不下返回尽量多的点。
     单车道路段（行驶方向无同向相邻车道，自车无法换道避让）不放障碍，避免堵死自车。"""
     if len(waypoints) < 2:
@@ -114,9 +121,9 @@ def _sample_route_obstacles(waypoints, n=3, min_gap=10.0):
         cum.append(cum[-1] + math.hypot(waypoints[i]["x"] - waypoints[i - 1]["x"],
                                         waypoints[i]["y"] - waypoints[i - 1]["y"]))
     total = cum[-1]
-    if total < 30:
+    if total < OBSTACLE_MIN_ROUTE_LEN:
         return []
-    lo, hi = 0.15 * total, 0.85 * total
+    lo, hi = OBSTACLE_RANGE[0] * total, OBSTACLE_RANGE[1] * total
 
     def interp(s):
         p = 0
@@ -153,13 +160,13 @@ def _sample_route_obstacles(waypoints, n=3, min_gap=10.0):
         except Exception:
             return False
 
-    # 路口弧长集合（采样时保持 ≥10m 远离，避免把障碍放到路口及其减速/停车带）
+    # 路口弧长集合（采样时保持 OBSTACLE_JUNCTION_CLEAR 远离，避免把障碍放到路口及其减速/停车带）
     junction_s = [cum[i] for i, wp in enumerate(waypoints) if wp.get("is_junction")]
 
     def _far_from_junction(s):
-        return all(abs(s - js) >= 10.0 for js in junction_s)
+        return all(abs(s - js) >= OBSTACLE_JUNCTION_CLEAR for js in junction_s)
 
-    # 多次随机放置，找到「间距达标、非单车道、且离路口≥10m」的组合；
+    # 多次随机放置，找到「间距达标、非单车道、且离路口达标」的组合；
     # 否则退化为等分后逐点剔除不合格点
     best = []
     for _ in range(60):

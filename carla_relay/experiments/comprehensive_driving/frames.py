@@ -62,7 +62,9 @@ class PlanOutput:
     avoid_side: int                       # 1=左 / -1=右 / 0=无
     avoid_lat_target: float               # 换道目标横向偏移
     avoid_dest_lane: Optional[Tuple]      # 换道目标车道 (road_id, lane_id)
-    fsm_state: str                        # CRUISE/APPROACH_RED/FOLLOW/LANE_CHANGE
+    nudge: bool                           # 是否贴边绕行（空隙穿越，shift 点剖面）
+    nudge_gap: float                      # 贴边空隙宽度（m；0=未绕行）
+    fsm_state: str                        # CRUISE/APPROACH_RED/FOLLOW/LANE_CHANGE/NUDGE
     front_obstacle: float                 # 本道走廊最近障碍后缘距离（inf=无）
     front_obs_src: str                    # 最近障碍类别（SSE 展示用）
     n_cands: int                          # 候选数（FRM 日志用）

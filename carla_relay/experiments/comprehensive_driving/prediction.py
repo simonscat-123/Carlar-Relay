@@ -25,3 +25,25 @@ class ObstaclePredictor:
     def extrapolate(self, obs: Dict, dt: float) -> float:
         """障碍 obs 在 dt 秒后的纵向位置（沿参考线）。"""
         return obs["s"] + obs["v_s"] * dt
+
+    def predict(self, obs: Dict, *, dt: float = 0.25, horizon: float = 4.0) -> Dict:
+        """对单个障碍物生成预测摘要（保持单恒速轨迹）。
+
+        恒速模型为确定性单轨迹，故把时间网格上的采样点作为候选轨迹点集合；
+        概率最大的轨迹即该名义轨迹本身（prob=1.0）。
+        返回（纯数据，不依赖日志）：调用方负责落日志。
+        """
+        n = max(1, int(round(horizon / dt)))
+        points = [(k * dt, self.extrapolate(obs, k * dt)) for k in range(1, n + 1)]
+        s0 = obs["s"]
+        vs = obs["v_s"]
+        s_end = points[-1][1] if points else s0
+        best = {
+            "prob": 1.0,                 # 概率最大（也是唯一）的轨迹
+            "t": points[-1][0] if points else 0.0,
+            "s_start": s0,
+            "s_end": s_end,
+            "dist": s_end - s0,
+            "v_s": vs,
+        }
+        return {"points": points, "n_cand": len(points), "best": best}

@@ -389,6 +389,7 @@ def _run_exp10(args):
         speed_history = collections.deque(maxlen=240)
         cte_history = collections.deque(maxlen=240)
         _dbg_frame = 0  # 诊断日志计数器（每 20 帧≈1s 输出一次）
+        _pred_seen = set()  # 预测日志去重：记录已出现过的障碍物 key（首次识别即记录）
 
         while not _EXP10_ABORT:
             world.tick()  # 同步模式：推进一帧，车辆据此移动
@@ -449,6 +450,30 @@ def _run_exp10(args):
             perc = perceiver.step(perception_on, vehicle, ego_tf, loc.fused_loc,
                                   _scan_j0, _scan_j1, inst, sem,
                                   _instance_raw, _semantic_raw)
+
+            # ── 预测层日志：识别到障碍物即预测并记录（id/类别/候选点数/概率最大轨迹）──
+            # 恒速模型为确定性单轨迹：候选轨迹点=时间网格采样点(0.25~4s)共16点，
+            # 概率最大的轨迹即该名义轨迹本身(prob≈1.0)。首次出现立即记录，之后每10帧一次。
+            for _o in perc.obstacles:
+                _pred_key = (_o["id"] if _o["id"] is not None
+                             else (_o["cls"], round(_o["s"], 1), round(_o["l"], 1)))
+                _new_obs = _pred_key not in _pred_seen
+                _pred_seen.add(_pred_key)
+                if _new_obs or _dbg_frame % 10 == 0:
+                    _psum = predictor.predict(_o)
+                    _b = _psum["best"]
+                    _cat = _dynamic_class(_o["cls"])
+                    if abs(_b["v_s"]) < 0.1:
+                        _shape = f"静止({_b['t']:.1f}s内s≈{_b['s_start']:.1f}m)"
+                    else:
+                        _shape = (f"沿参考线匀速直行 l={_o['l']:+.1f}m "
+                                  f"{_b['dist']:+.1f}m@{_b['t']:.1f}s")
+                    _plan_log(
+                        f"PRED obs={_o['id'] if _o['id'] is not None else '-'} "
+                        f"cat={_cat} cls={_o['cls']} "
+                        f"cand={_psum['n_cand']}pt "
+                        f"best(prob={_b['prob']:.2f}) s={_b['s_start']:.1f}→{_b['s_end']:.1f} "
+                        f"{_shape}")
 
             # bbox 渲染：扫描之后立即用本 tick 检测结果 + 本 tick 相机帧渲染
             # （避开尾部延迟让 bbox 赶上 SSE 采样；检测框与画面同步）
