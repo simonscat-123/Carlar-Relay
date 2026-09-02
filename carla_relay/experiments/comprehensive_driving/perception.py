@@ -258,10 +258,16 @@ class Perceiver:
                         lane_id = (owp.road_id, owp.lane_id)
                 except Exception:
                     pass
+                try:
+                    _wv = [{"x": v.x, "y": v.y, "z": v.z}
+                           for v in actor.bounding_box.get_world_vertices(actor.get_transform())]
+                except Exception:
+                    _wv = None
                 obstacles.append({
                     "s": s_o, "l": l_o,
                     "half_len": float(bb.x),   # 真值模式：包围盒半长（extent 为半尺寸）
                     "half_w": float(bb.y),
+                    "verts": _wv,              # 真实包围盒世界顶点（HMI 精确投影）
                     "v_s": vel.x * tx_o + vel.y * ty_o,  # 沿参考线的纵向速度
                     "lane": lane_id, "cls": tid, "id": actor.id,
                 })

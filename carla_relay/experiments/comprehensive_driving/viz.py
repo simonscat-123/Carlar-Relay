@@ -124,26 +124,32 @@ def render_perceived_frame(rgb_arr, perceived, inst_w, inst_h):
 
 def render_bbox_overlay(inst, rgb_raw, instance_raw, perception_on, perceived,
                         bbox_cands, sensor_frames, sensor_frame_num, diag, log):
-    """主循环 bbox 渲染：本 tick 检测结果 + 本 tick 相机帧 → 写入帧缓存。
-    diag: {"ok","skip","err"} 渲染诊断计数（就地更新）。"""
+    """主循环 bbox 渲染：本 tick 检测结果 + 本 tick 相机帧 → 返回渲染后的 JPEG。
+
+    不再直接写 sensor_frames[inst.id]，改为**返回** bytes，由后接的
+    overlay_3d_boxes 在同一帧上叠 3D 后一次性写回，避免 SSE 线程读到
+    "只有 2D 无 3D" 的中间帧导致 3D 框闪烁消失。
+    diag: {"ok","skip","err"} 渲染诊断计数（就地更新）。返回 bytes 或 None。
+    """
     if rgb_raw["raw"] is not None and inst.id in instance_raw:
         try:
             _rgb_arr = np.frombuffer(rgb_raw["raw"], dtype=np.uint8).reshape((rgb_raw["h"], rgb_raw["w"], 4))
             _ih = int(inst.attributes["image_size_y"])
             _iw = int(inst.attributes["image_size_x"])
             if perception_on:
-                sensor_frames[inst.id] = render_perceived_frame(_rgb_arr, perceived, _iw, _ih)
+                out = render_perceived_frame(_rgb_arr, perceived, _iw, _ih)
             else:
                 _inst_arr = np.frombuffer(instance_raw[inst.id], dtype=np.uint8).reshape((_ih, _iw, 4))
-                sensor_frames[inst.id] = render_bbox_frame(_rgb_arr, _inst_arr, bbox_cands)
-            sensor_frame_num[inst.id] = sensor_frame_num.get(inst.id, 0) + 1
+                out = render_bbox_frame(_rgb_arr, _inst_arr, bbox_cands)
             diag["ok"] += 1
+            return out
         except Exception as exc:
             diag["err"] += 1
             if diag["err"] <= 3:
                 log(f"bbox渲染异常#{diag['err']}: {exc!r}")
     else:
         diag["skip"] += 1
+    return None
 
 
 # ── 3D 包围框叠加（自车 + 障碍：真实框实线 / 带余量框虚线）─────────────
@@ -222,6 +228,12 @@ _BOX_EDGES = [(0, 1), (1, 2), (2, 3), (3, 0),   # 底框
               (4, 5), (5, 6), (6, 7), (7, 4),   # 顶框
               (0, 4), (1, 5), (2, 6), (3, 7)]   # 竖棱
 
+# 官方 bounding_boxes.py 配套 get_world_vertices() 顺序的连线表（顶点顺序不同，
+# 不能与上面手工 bottom+top 表混用）。
+_OFFICIAL_EDGES = [(0, 1), (1, 3), (3, 2), (2, 0),   # 底面
+                   (0, 4), (4, 5), (5, 1), (5, 7),   # 竖棱 + 顶面前边
+                   (7, 6), (6, 4), (6, 2), (7, 3)]   # 顶面 + 后竖棱
+
 
 def _dashed(draw, a, b, color, width=2, dash=8, gap=5):
     x0, y0, x1, y1 = a[0], a[1], b[0], b[1]
@@ -237,9 +249,10 @@ def _dashed(draw, a, b, color, width=2, dash=8, gap=5):
         d = d2 + gap
 
 
-def _draw_box(draw, pixels, color, dashed=False, full3d=True, width=2):
-    """pixels: [8] 像素点。full3d 时画立体线框，否则只画底框足迹。"""
-    edges = _BOX_EDGES if full3d else [(0, 1), (1, 2), (2, 3), (3, 0)]
+def _draw_box(draw, pixels, color, dashed=False, full3d=True, width=2,
+              edges3=_BOX_EDGES, edgesf=((0, 1), (1, 2), (2, 3), (3, 0))):
+    """pixels: [8] 像素点。full3d 用 edges3 画立体线框，否则用 edgesf 画底框足迹。"""
+    edges = edges3 if full3d else edgesf
     for ia, ib in edges:
         a, b = pixels[ia], pixels[ib]
         if a is None or b is None:
@@ -254,7 +267,7 @@ _BOX_DBG = {"n": 0}
 
 
 def overlay_3d_boxes(*, vehicle, fused_loc, fused_yaw_deg, obstacles, reference,
-                     inst, bird, sensor_frames, log):
+                     inst, bird, sensor_frames, log, inst_frame=None, sensor_frame_num=None):
     """在目标识别相机(inst)与鸟瞰相机(bird)上叠加自车+障碍的 3D/足迹包围框。
 
     侵入面：仅改写 _sensor_frames[inst.id]/[bird.id] 的编码帧，不动上层决策。
@@ -269,47 +282,116 @@ def overlay_3d_boxes(*, vehicle, fused_loc, fused_yaw_deg, obstacles, reference,
             f"bird帧={'在' if _has.get(bird.id) else '无'}")
 
     ground_z = fused_loc.z - 0.9  # 道路近似高度（自车中心 -0.9 落地）
-    specs = []
-    eb = _ego_box_pts(fused_loc.x, fused_loc.y, fused_yaw_deg, EGO_HL, EGO_HW, EGO_H, ground_z)
-    specs.append({"color": (0, 220, 255), "set": eb})                    # 自车·真实
-    eb_m = _ego_box_pts(fused_loc.x, fused_loc.y, fused_yaw_deg,
-                        EGO_HL + COLL_S, EGO_HW + SEP_MIN, EGO_H, ground_z)
-    specs.append({"color": (0, 120, 255), "set": eb_m, "dashed": True})  # 自车·带余量
+    records = []
+    out = {"bbox": [], "bird": []}
+
+    def add(col, pts, dashed, truth=False, foot=None):
+        """pts: [8] 三维点（carla.Location 或含 x/y/z）→ 投影后画框。
+        truth: 用官方连线表（真实框顶点序）；foot: 底面矩形点（bird 足迹专用，
+        替代固定索引连线，避免正下视塌缩成线）。"""
+        e3 = _OFFICIAL_EDGES if truth else _BOX_EDGES
+        records.append({"color": col, "pts": pts, "dashed": dashed,
+                        "edges3": e3, "foot": foot})
+
+    # 自车：真实框用 bounding_box 世界顶点（官方同款，绝对贴合）；余量框用
+    # 融合位姿重建（真实框对齐后，余量框即所见即决策）。
+    try:
+        ego_verts = [carla.Location(v.x, v.y, v.z)
+                     for v in vehicle.bounding_box.get_world_vertices(vehicle.get_transform())]
+    except Exception:
+        ego_verts = None
+    if ego_verts:
+        ego_ground = min(v.z for v in ego_verts)   # 自车真实地面高度
+    else:
+        ego_ground = ground_z
+    if ego_verts:
+        # bbox 用真实顶点贴物；bird 足迹用「重建底面矩形」（与虚线同法，避免
+        # 路面有坡度时真实底面 4 顶点 z 不等、提取不足而塌缩成线）
+        _bt = _ego_box_pts(fused_loc.x, fused_loc.y, fused_yaw_deg,
+                           EGO_HL, EGO_HW, EGO_H, ego_ground)
+        add((0, 220, 255), ego_verts, False, truth=True, foot=_bt[0])  # 自车·真实
+    else:
+        _bt = _ego_box_pts(fused_loc.x, fused_loc.y, fused_yaw_deg,
+                           EGO_HL, EGO_HW, EGO_H, ego_ground)
+        add((0, 220, 255), _bt[0] + _bt[1], False)
+    _bt = _ego_box_pts(fused_loc.x, fused_loc.y, fused_yaw_deg,
+                       EGO_HL + COLL_S, EGO_HW + SEP_MIN, EGO_H, ego_ground)
+    add((0, 120, 255), _bt[0] + _bt[1], True)                          # 自车·带余量
     for o in obstacles:
         h_full = 1.8 if str(o["cls"]).startswith("walker") else 1.5
-        ob = _obs_box_pts(reference, o, o["half_len"], o["half_w"], h_full, ground_z)
-        specs.append({"color": (255, 180, 0), "set": ob})               # 障碍·真实
-        ob_m = _obs_box_pts(reference, o, o["half_len"] + COLL_S,
-                            o["half_w"] + SEP_MIN, h_full, ground_z)
-        specs.append({"color": (255, 60, 60), "set": ob_m, "dashed": True})  # 障碍·带余量
+        ov = o.get("verts")
+        if ov:
+            # 真值模式：直接用真实包围盒世界顶点，位置与物体严格重合
+            pts = [carla.Location(v["x"], v["y"], v["z"]) if isinstance(v, dict) else v
+                   for v in ov]
+            o_ground = min(v.z for v in pts)          # 障碍真实地面高度
+            _ob = _obs_box_pts(reference, o, o["half_len"], o["half_w"],
+                               h_full, o_ground)
+            add((255, 180, 0), pts, False, truth=True, foot=_ob[0])  # 障碍·真实
+        else:
+            o_ground = ground_z
+            _bt = _obs_box_pts(reference, o, o["half_len"],
+                               o["half_w"], h_full, o_ground)
+            add((255, 180, 0), _bt[0] + _bt[1], False)
+        _bt = _obs_box_pts(reference, o, o["half_len"] + COLL_S,
+                           o["half_w"] + SEP_MIN, h_full, o_ground)
+        add((255, 60, 60), _bt[0] + _bt[1], True)                        # 障碍·带余量
 
     for cam, full3d in ((inst, True), (bird, False)):
+        tag = "bbox" if full3d else "bird"
         try:
-            jpeg = sensor_frames.get(cam.id)
+            # inst：直接用本 tick 由 render_bbox_overlay 返回的 bbox 帧叠加（若有），
+            # 否则回退帧缓存旧值——保证 sensor_frames[inst.id] 每 tick 只被写一次
+            # 完整帧（2D+3D），切断 SSE 读到中间帧导致的闪烁。
+            if cam.id == inst.id and inst_frame is not None:
+                jpeg = inst_frame
+            else:
+                jpeg = sensor_frames.get(cam.id)
             if jpeg is None:
+                if cam.id == inst.id and inst_frame is not None and sensor_frame_num is not None:
+                    sensor_frame_num[inst.id] = sensor_frame_num.get(inst.id, 0) + 1
                 continue
             # 帧可能是被其他渲染改写后的图（如 bbox 叠加把 inst 图换成前相机
             # 1280x720 的 RGB），故用 jpeg 实际像素尺寸投影，避免内参/画面错配。
             img = PIL.Image.open(io.BytesIO(jpeg)).convert("RGB")
             w, h = img.size
             draw = PIL.ImageDraw.Draw(img)
-            for sp in specs:
-                bottom, top = sp["set"]
-                pts = _project_points(bottom + top, vehicle, cam, w, h)
-                _draw_box(draw, pts, sp["color"], dashed=sp.get("dashed", False),
-                          full3d=full3d)
+            for rec in records:
+                pixels = _project_points(rec["pts"], vehicle, cam, w, h)
+                # 用投影线段同时支持「写回 JPEG」和「下发 payload 供 local_runner 画」
+                if full3d:
+                    edges = rec["edges3"]
+                elif rec.get("foot") is not None:
+                    # bird 足迹：真实框用提取的底面矩形（防正下视塌缩成线）
+                    fpix = _project_points(rec["foot"], vehicle, cam, w, h)
+                    edges = [(i, (i + 1) % 4) for i in range(4)]
+                    _px = dict(enumerate(fpix))
+                    pixels = _px  # 供下方按索引连线
+                else:
+                    edges = [(0, 1), (1, 2), (2, 3), (3, 0)]
+                segs = []
+                for ia, ib in edges:
+                    a, b = pixels[ia], pixels[ib]
+                    if a is None or b is None:
+                        continue
+                    segs.append([list(a), list(b)])
+                    if rec["dashed"]:
+                        _dashed(draw, a, b, rec["color"], width=2)
+                    else:
+                        draw.line([a[0], a[1], b[0], b[1]],
+                                  fill=rec["color"], width=2)
+                out[tag].append({"segs": segs,
+                                 "color": list(rec["color"]),
+                                 "dashed": rec["dashed"]})
             buf = io.BytesIO()
             img.save(buf, format="JPEG", quality=80)
             sensor_frames[cam.id] = buf.getvalue()
-            # 首个可投影自车框：打印自车底框中心像素，便于确认投影是否落在画面上
-            if _BOX_DBG["n"] < 12:
-                _BOX_DBG["n"] += 1
-                ctr = _project_points([eb[1][2]], vehicle, cam, w, h)[0]
-                log(f"3DBOX cam={str(cam.id)[:6]} 首帧自车框中心像素={ctr} "
-                    f"(画面{w}x{h}) specs={len(specs)} in3d={full3d}")
+            if sensor_frame_num is not None:
+                sensor_frame_num[cam.id] = sensor_frame_num.get(cam.id, 0) + 1
         except Exception:
             import traceback
             log("3D框渲染异常:\n" + traceback.format_exc())
+    return out
 
 
 def render_semantic_frame(sem, semantic_raw, sensor_frames, sensor_frame_num,
@@ -336,9 +418,10 @@ def build_sse_payload(*, t, wp_idx, route_wp, route_lane_ids, sampling_res,
                       brake, cte, loc_err, front_obstacle, arrived,
                       perception_on, perceived_count, gt_loc, gt_yaw,
                       ngx, ngy, plan, obs_list, planned_obstacles, tl,
-                      carla_map):
+                      carla_map, viz3d=None):
     """组装 SSE 实验数据帧（前端零改动的兼容字段集）。
-    plan: PlanOutput；tl: TlFrame。"""
+    plan: PlanOutput；tl: TlFrame。viz3d: overlay_3d_boxes 返回的 bbox/bird
+    投影线段，供 local_runner 与车道线同通道即时绘制（避免 JPEG 闪烁）。"""
     # ── 鸟瞰可视化数据：当前/目标车道、参考线（含换道 S 弯）、预测轨迹 ──
     cur_lane = None
     try:
@@ -439,5 +522,7 @@ def build_sse_payload(*, t, wp_idx, route_wp, route_lane_ids, sampling_res,
             "avoid": {"active": plan.avoiding, "side": plan.avoid_side,
                       "offset": round(plan.avoid_lat_target, 2)},
             "fsm": plan.fsm_state,
+            "bbox3d": (viz3d or {}).get("bbox", []),
+            "bird3d": (viz3d or {}).get("bird", []),
         }
     }

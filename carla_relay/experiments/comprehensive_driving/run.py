@@ -545,18 +545,21 @@ def _run_exp10(args):
                         f"{_shape}")
 
             # bbox 渲染：扫描之后立即用本 tick 检测结果 + 本 tick 相机帧渲染
-            # （避开尾部延迟让 bbox 赶上 SSE 采样；检测框与画面同步）
-            render_bbox_overlay(inst, rig.rgb_raw, _instance_raw, perception_on,
-                                perc.perceived, perc.bbox_cands,
-                                _sensor_frames, _sensor_frame_num, _bbox_diag, _exp_log)
+            # （避开尾部延迟让 bbox 赶上 SSE 采样；检测框与画面同步）。
+            # 返回本 tick 的 bbox 帧，交 overlay 叠 3D 后单次写回，消除闪烁。
+            _inst_jpeg = render_bbox_overlay(inst, rig.rgb_raw, _instance_raw,
+                                             perception_on, perc.perceived,
+                                             perc.bbox_cands, _sensor_frames,
+                                             _sensor_frame_num, _bbox_diag, _exp_log)
 
             # 目标识别相机 + 鸟瞰相机：叠加自车/障碍的 3D 包围框（真实框实线、
             # 带余量框虚线，余量=SEP_MIN/COLL_S）。纯可视化，不改决策逻辑。
-            overlay_3d_boxes(vehicle=vehicle, fused_loc=loc.fused_loc,
-                             fused_yaw_deg=loc.fused_yaw_deg,
-                             obstacles=perc.obstacles, reference=reference,
-                             inst=inst, bird=bird, sensor_frames=_sensor_frames,
-                             log=_both_log)
+            _viz3d = overlay_3d_boxes(vehicle=vehicle, fused_loc=loc.fused_loc,
+                                      fused_yaw_deg=loc.fused_yaw_deg,
+                                      obstacles=perc.obstacles, reference=reference,
+                                      inst=inst, bird=bird, sensor_frames=_sensor_frames,
+                                      inst_frame=_inst_jpeg, sensor_frame_num=_sensor_frame_num,
+                                      log=_both_log)
 
             # 车速 + Frenet 位姿（先于红绿灯判定与决策规划，供同帧使用）
             vel = vehicle.get_velocity()
@@ -668,7 +671,8 @@ def _run_exp10(args):
                 arrived=arrived, perception_on=perception_on,
                 perceived_count=len(perc.perceived), gt_loc=gt_loc, gt_yaw=gt_yaw,
                 ngx=loc.ngx, ngy=loc.ngy, plan=plan, obs_list=perc.obs_list,
-                planned_obstacles=_EXP10_PLANNED_OBSTACLES, tl=tl, carla_map=carla_map))
+                planned_obstacles=_EXP10_PLANNED_OBSTACLES, tl=tl, carla_map=carla_map,
+                viz3d=_viz3d))
 
             # 同步模式下 tick 已按固定时间步推进并阻塞至该帧完成，无需额外 sleep
             # time.sleep(0.05)  # 20fps
