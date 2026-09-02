@@ -22,7 +22,7 @@
     "perceiver": "v2",
     "tl_stop_margin": 0.5,
     "tl_brake_window": 30.0,
-    "dec_win": 15.0,
-    "perception_range": 20.0
+    "dec_win": 25.0,
+    "perception_range": 25.0
   }
 }

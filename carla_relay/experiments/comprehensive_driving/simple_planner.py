@@ -36,9 +36,9 @@ from carla_relay.experiments.comprehensive_driving.params import read
 # ── 参数来源登记（key, 默认, 类型, 来源, 说明）────────────────────────────
 # 来源: JSON=构造注入 params（/start body→_run_exp10(args)）
 #       CONST=模块级硬编码兜底默认。正文刻意保持少量可调量。
-P_DEC_WIN = ("dec_win", 15.0, float, "JSON")  # 前方阻挡障碍检查范围（m）
-AVOID_MARGIN = 1.0    # 单一横向余量（m）：障碍边 → 本车边（含执行层跟踪误差预算）
-EDGE_MARGIN = 0.3     # 域边界余量（m）：本车边 → 可行驶域边界
+P_DEC_WIN = ("dec_win", 25.0, float, "JSON")  # 前方阻挡障碍检查范围（m）
+AVOID_MARGIN = 0.1    # 单一横向余量（m）：障碍边 → 本车边（含执行层跟踪误差预算）
+EDGE_MARGIN = 0.2     # 域边界余量（m）：本车边 → 可行驶域边界
 SEP_MIN = 0.2         # 碰撞安全网的最小横向分离（m）
 OBS_VMAX = 0.5        # 允许几何绕行的障碍最大速度（m/s）
 COMFORT_A = 2.5       # 舒适减速度（m/s²）
@@ -49,8 +49,6 @@ RETURN_X = 2.0        # 回正触发：车尾越过障碍前缘此余量后才�
 HORIZON = 60.0        # 输出轨迹长度（m，与鸟瞰可视范围一致）
 STEP_S = 2.0          # 轨迹采样步长（m）
 COMMITTED_L = 0.5     # 「已离开本道」判定的横向偏移阈值（m）
-PROBE_RANGE = 6.0     # 地图级横向探测半径（m）
-PROBE_STEP = 0.25     # 地图级横向探测网格步长（m）
 POSE_WIN_AHEAD = 6.0  # 实际位姿安全网：纵向刹停窗口下限（m）
 
 
@@ -71,27 +69,8 @@ class SimplePlanner:
 
     # ── 工具 ────────────────────────────────────────────────────────────
     def _probe_drivable(self, s, aggressive_on):
-        """地图级横向网格探测：返回可行驶区间 [(lo,hi),...]。
-
-        非激进只扫同向（lat_driving_fwd）；激进扫全部 Driving 路面
-        （lat_driving，含对向），对向候选由后续两级排序排后。区间边界
-        按网格保守收缩一个步长（等效附加余量）。
-        """
-        fn = self._ref.lat_driving if aggressive_on else self._ref.lat_driving_fwd
-        ivs = []
-        lo = None
-        n = int(PROBE_RANGE / PROBE_STEP)
-        for i in range(-n, n + 1):
-            l = i * PROBE_STEP
-            ok = fn(l, s)
-            if ok and lo is None:
-                lo = l
-            elif not ok and lo is not None:
-                ivs.append((lo, l - PROBE_STEP))
-                lo = None
-        if lo is not None:
-            ivs.append((lo, PROBE_RANGE))
-        return ivs
+        """地图级横向网格探测（委托 ReferenceLine.probe_drivable，可视化同源）。"""
+        return self._ref.probe_drivable(s, aggressive_on)
 
     def _blockers(self, obstacles, ego_s):
         """前方决策窗内、横向上挡住本道的障碍（含并行中，不含已越过）。
@@ -151,7 +130,8 @@ class SimplePlanner:
 
         if blockers and not dynamic_block:
             # ── F1 几何绕行：地图级横向网格探测生成候选 ──
-            # 唯一真相源 = lat_driving(_fwd) 直接扫描（±PROBE_RANGE 网格），
+            # 唯一真相源 = lat_driving(_fwd) 直接扫描（±PROBE_RANGE 网格，
+            # 见 ReferenceLine.probe_drivable），
             # 不经缓存域（实测 20260902_170121：缓存域不含右侧同向绿道，
             # 右候选在生成阶段即被杀，只剩逆行左道可选）。障碍联合占用
             # 包络两侧按「清障几何 + 本车宽 + 单一余量」构造目标，并整体
@@ -184,6 +164,14 @@ class SimplePlanner:
                           iv_hi - self._ego_half_w - EDGE_MARGIN)
                 if l_t >= iv_lo + self._ego_half_w + EDGE_MARGIN:
                     cands.append((l_t, -1))
+            # 候选空诊断：有阻挡但无任何侧生成候选 → 打印实际探测区间与包络，
+            # 定位「地形真没空间 vs 域边界/余量过严」。
+            if blockers and not cands and not too_close:
+                _ivs = ",".join(f"[{a:.1f},{b:.1f}]" for a, b in
+                                self._probe_drivable(s_mid, aggressive_on))
+                plan_log(f"GEN0 t={t:.1f} 候选空 s_mid={s_mid:.1f} "
+                         f"agg={int(aggressive_on)} hw={self._ego_half_w:.2f} "
+                         f"lo={l_lo:.2f} hi={l_hi:.2f} ivs={_ivs}")
             # 两级字典序：① 同向合法（地图级 lat_driving_fwd 点查）→
             # ② 幅度最小 → ③ 先左。即「除非只能逆行，否则不逆行」；
             # 非激进模式探测本身只含同向路面，① 恒为 0。

@@ -21,6 +21,11 @@ import math
 import carla
 
 
+# 地图级横向探测参数（可视化与规划器共用，保证「所见即决策」同源）
+PROBE_RANGE = 6.0     # 横向探测半径（m）
+PROBE_STEP = 0.25     # 横向探测网格步长（m）
+
+
 class ReferenceLine:
     """全局参考线：弧长表 + Frenet 变换 + 可行驶域查询。"""
 
@@ -280,6 +285,31 @@ class ReferenceLine:
             return (f.x * tx + f.y * ty) > 0.3
         except Exception:
             return False
+
+    # ── 可行驶域横向网格探测（规划器与可视化同源）────────────────────────
+    def probe_drivable(self, s, aggressive_on):
+        """地图级横向网格探测：返回可行驶区间 [(lo,hi),...]。
+
+        非激进只扫同向（lat_driving_fwd）；激进扫全部 Driving 路面
+        （lat_driving，含对向），对向候选由后续两级排序排后。区间边界
+        按网格保守收缩一个步长（等效附加余量）。SimplePlanner 与
+        build_gap_viz 均调用本方法，保证「所见即决策」使用同一份域。
+        """
+        fn = self.lat_driving if aggressive_on else self.lat_driving_fwd
+        ivs = []
+        lo = None
+        n = int(PROBE_RANGE / PROBE_STEP)
+        for i in range(-n, n + 1):
+            l = i * PROBE_STEP
+            ok = fn(l, s)
+            if ok and lo is None:
+                lo = l
+            elif not ok and lo is not None:
+                ivs.append((lo, l - PROBE_STEP))
+                lo = None
+        if lo is not None:
+            ivs.append((lo, PROBE_RANGE))
+        return ivs
 
     # ── 停止线绑定（地图先验，一次性）────────────────────────────────────
     def bind_traffic_lights(self, world, log):

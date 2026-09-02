@@ -156,9 +156,11 @@ def render_bbox_overlay(inst, rgb_raw, instance_raw, perception_on, perceived,
 # 纯可视化，不改感知/规划/控制。世界系角点 → 相机系 → 像素，透视投影画线框。
 # 目标识别相机：画 8 角点立体线框；鸟瞰相机：画地面足迹(实/虚矩形)。
 # 尺寸/朝向来源：自车=fused 定位 + 车体常量；障碍=Frenet(s,l)→世界 + 类别高度。
-# 余量 = 规划决策用余量 SEP_MIN(横向)/COLL_S(纵向)，所见即决策所用。
-SEP_MIN = 0.2            # 与 simple_planner.SEP_MIN 一致的横向分离余量（m）
-COLL_S = 0.5             # 与 planner.COLL_S 一致的纵向碰撞余量（m）
+# 余量 = simple_planner 实际越障/clr 用的单一余量 AVOID_MARGIN（障碍边→本车边，含
+# 执行层跟踪误差预算）。障碍画余量虚线框（禁区边界）；自车画真实框 + 纯车宽
+# 参考虚线框（同尺寸不带余量），可过判断由 build_gap_viz 可容带完成（带宽≥车宽）
+# → 所见即决策。
+from carla_relay.experiments.comprehensive_driving.simple_planner import AVOID_MARGIN, EDGE_MARGIN
 EGO_HW = 1.0             # 自车半宽（m）
 EGO_HL = 2.45            # 自车半长（m）
 EGO_H = 1.5              # 自车高（m）
@@ -265,6 +267,94 @@ def _draw_box(draw, pixels, color, dashed=False, full3d=True, width=2,
 
 _BOX_DBG = {"n": 0}
 
+# 已输出过宽度诊断的障碍 id（按 id 去重，每障碍只打一次）
+_GAP_LOG_IDS = set()
+
+
+def build_gap_viz(reference, obstacles, ego_half_w, ego_half_len, ego_s=None,
+                  aggressive_on=True, limit=4, log=None):
+    """鸟瞰「车身可容空间」可视化数据：每个前方障碍所在横断面，用与
+    SimplePlanner 同源的 ReferenceLine.probe_drivable 可行驶域区间，按同一
+    带宽公式求两侧可容带（可容带 = 车边可到区间：障碍禁区外边 ↔ 域边界
+    −EDGE_MARGIN）+ 可容宽 + 该侧能否通过（带宽 ≥ 车宽 2×ego_half_w），
+    与规划器候选生成公式严格同源 → 所见即决策。
+    返回 {"ego_req_w":…, "sides":[…]}; 无参考线 / 无有效障碍时 sides 为空。"""
+    out = {"ego_req_w": round(2 * ego_half_w, 2), "sides": []}
+    if reference is None:
+        return out
+    items = []
+    for o in obstacles or []:
+        if ego_s is not None:
+            # 只看前方未越过的障碍（后缘不落后自车 4m、前缘不超 60m）
+            if o["s"] + o["half_len"] < ego_s - 4.0 or o["s"] - o["half_len"] > ego_s + 60.0:
+                continue
+        items.append(o)
+    items.sort(key=lambda o: o["s"] - o["half_len"])   # 由近及远
+    for o in items[:limit]:
+        s_lo, s_hi = o["s"] - o["half_len"], o["s"] + o["half_len"]
+        s_rear_ob = o["s"] - o["half_len"]
+        s_mid = s_rear_ob if s_rear_ob > (ego_s or 0.0) else (ego_s or 0.0) + 6.0
+        ivs = reference.probe_drivable(s_mid, aggressive_on)   # 与决策同源
+        _log_lines = []
+        for side in (-1, 1):
+            l_lo = o["l"] - o["half_w"]     # 障碍左缘
+            l_hi = o["l"] + o["half_w"]     # 障碍右缘
+            best_w, best_a, best_b, best_iv = None, None, None, None
+            for iv_lo, iv_hi in ivs:
+                # 可容带 = 车边可到区间（与 simple_planner 候选公式同源）：
+                #   左：外侧 = iv_lo + EDGE，内侧 = min(障碍左缘 − AVOID, iv_hi − EDGE)
+                #   右：内侧 = max(障碍右缘 + AVOID, iv_lo + EDGE)，外侧 = iv_hi − EDGE
+                if side < 0:
+                    a = iv_lo + EDGE_MARGIN
+                    b = min(l_lo - AVOID_MARGIN, iv_hi - EDGE_MARGIN)
+                else:
+                    a = max(l_hi + AVOID_MARGIN, iv_lo + EDGE_MARGIN)
+                    b = iv_hi - EDGE_MARGIN
+                w = b - a
+                if best_w is None or w > best_w:
+                    best_w, best_a, best_b, best_iv = w, a, b, (iv_lo, iv_hi)
+            if best_iv is None:
+                continue                     # 该横断面无可行驶域，跳过
+            free = (l_lo - best_iv[0]) if side < 0 else (best_iv[1] - l_hi)
+            corridor = best_w if best_w is not None else 0.0
+            if corridor > 0.05:
+                l_a, l_b = best_a, best_b
+            else:
+                # 无可容空间：在带宽中点画红色细带，提示本侧不可通过
+                l_mid = (best_a + best_b) / 2
+                l_a, l_b = l_mid - 0.2, l_mid + 0.2
+            # 平行四边形：沿障碍长度 s_lo→s_hi，横向 可容带内/外侧
+            # reference.world() 返回 (x, y) 元组（非 carla.Location）
+            poly = [reference.world(s_lo, l_a), reference.world(s_hi, l_a),
+                    reference.world(s_hi, l_b), reference.world(s_lo, l_b)]
+            lx, ly = reference.world(o["s"], (l_a + l_b) / 2)
+            # EDGE 边界余量保留区：可容带外侧 → 探测域边界（本车不会进入）
+            e_in = l_a if side < 0 else l_b
+            e_out = best_iv[0] if side < 0 else best_iv[1]
+            e_poly = [reference.world(s_lo, e_in), reference.world(s_hi, e_in),
+                      reference.world(s_hi, e_out), reference.world(s_lo, e_out)]
+            out["sides"].append({
+                "poly": [[round(p[0], 2), round(p[1], 2)] for p in poly],
+                "width": round(max(0.0, corridor), 2),
+                "pass": corridor >= 2 * ego_half_w,
+                "label": [round(lx, 2), round(ly, 2)],
+                "edge_poly": [[round(p[0], 2), round(p[1], 2)] for p in e_poly],
+                "edge_margin": round(EDGE_MARGIN, 2),
+            })
+            _log_lines.append((side, free, corridor, corridor >= 2 * ego_half_w))
+        # 宽度诊断：每障碍首次出现打一次（探测域/两侧空闲/可容宽/可否通过）
+        oid = o.get("id")
+        if log is not None and oid is not None and oid not in _GAP_LOG_IDS:
+            _GAP_LOG_IDS.add(oid)
+            _ivs_txt = ",".join(f"[{a:.1f},{b:.1f}]" for a, b in ivs)
+            _side_txt = " ".join(
+                f"{'左' if side < 0 else '右'} free={free:.2f} "
+                f"fit={corr:.2f} {'可过' if corr is not None and corr >= 2 * ego_half_w else '不可过'}"
+                for side, free, corr, _ in _log_lines)
+            log(f"GAP 障碍#{oid} {o['cls']}@s={o['s']:.1f} l={o['l']:+.2f} "
+                f"半长={o['half_len']:.2f} 半宽={o['half_w']:.2f} ivs={_ivs_txt} | {_side_txt}")
+    return out
+
 
 def overlay_3d_boxes(*, vehicle, fused_loc, fused_yaw_deg, obstacles, reference,
                      inst, bird, sensor_frames, log, inst_frame=None, sensor_frame_num=None):
@@ -285,16 +375,18 @@ def overlay_3d_boxes(*, vehicle, fused_loc, fused_yaw_deg, obstacles, reference,
     records = []
     out = {"bbox": [], "bird": []}
 
-    def add(col, pts, dashed, truth=False, foot=None):
+    def add(col, pts, dashed, truth=False, foot=None, ego=False):
         """pts: [8] 三维点（carla.Location 或含 x/y/z）→ 投影后画框。
         truth: 用官方连线表（真实框顶点序）；foot: 底面矩形点（bird 足迹专用，
-        替代固定索引连线，避免正下视塌缩成线）。"""
+        替代固定索引连线，避免正下视塌缩成线）；ego: 自车框标记（仅鸟瞰画，
+        右侧 RGB 相机不画自车 3D 框）。"""
         e3 = _OFFICIAL_EDGES if truth else _BOX_EDGES
         records.append({"color": col, "pts": pts, "dashed": dashed,
-                        "edges3": e3, "foot": foot})
+                        "edges3": e3, "foot": foot, "ego": ego})
 
     # 自车：真实框用 bounding_box 世界顶点（官方同款，绝对贴合）；余量框用
     # 融合位姿重建（真实框对齐后，余量框即所见即决策）。
+    # 注意：自车 3D 框只画在鸟瞰(bird)；右侧 RGB(inst) 不画自车框（避免挡画面）。
     try:
         ego_verts = [carla.Location(v.x, v.y, v.z)
                      for v in vehicle.bounding_box.get_world_vertices(vehicle.get_transform())]
@@ -309,14 +401,17 @@ def overlay_3d_boxes(*, vehicle, fused_loc, fused_yaw_deg, obstacles, reference,
         # 路面有坡度时真实底面 4 顶点 z 不等、提取不足而塌缩成线）
         _bt = _ego_box_pts(fused_loc.x, fused_loc.y, fused_yaw_deg,
                            EGO_HL, EGO_HW, EGO_H, ego_ground)
-        add((0, 220, 255), ego_verts, False, truth=True, foot=_bt[0])  # 自车·真实
+        add((0, 220, 255), ego_verts, False, truth=True, foot=_bt[0],
+            ego=True)                                                  # 自车·真实
     else:
         _bt = _ego_box_pts(fused_loc.x, fused_loc.y, fused_yaw_deg,
                            EGO_HL, EGO_HW, EGO_H, ego_ground)
-        add((0, 220, 255), _bt[0] + _bt[1], False)
+        add((0, 220, 255), _bt[0] + _bt[1], False, ego=True)
+    # 自车纯车宽参考虚线框（=真实框同尺寸，不带 AVOID 余量；仅作车宽示意，
+    # 可过判断仍由 build_gap_viz 可容带完成，不引入"余量虚框"矛盾）
     _bt = _ego_box_pts(fused_loc.x, fused_loc.y, fused_yaw_deg,
-                       EGO_HL + COLL_S, EGO_HW + SEP_MIN, EGO_H, ego_ground)
-    add((0, 120, 255), _bt[0] + _bt[1], True)                          # 自车·带余量
+                       EGO_HL, EGO_HW, EGO_H, ego_ground)
+    add((0, 120, 255), _bt[0] + _bt[1], True, ego=True)                # 自车·纯车宽参考
     for o in obstacles:
         h_full = 1.8 if str(o["cls"]).startswith("walker") else 1.5
         ov = o.get("verts")
@@ -332,10 +427,10 @@ def overlay_3d_boxes(*, vehicle, fused_loc, fused_yaw_deg, obstacles, reference,
             o_ground = ground_z
             _bt = _obs_box_pts(reference, o, o["half_len"],
                                o["half_w"], h_full, o_ground)
-            add((255, 180, 0), _bt[0] + _bt[1], False)
-        _bt = _obs_box_pts(reference, o, o["half_len"] + COLL_S,
-                           o["half_w"] + SEP_MIN, h_full, o_ground)
-        add((255, 60, 60), _bt[0] + _bt[1], True)                        # 障碍·带余量
+            add((255, 180, 0), _bt[0] + _bt[1], False)                           # 障碍·真实(重建)
+        _mbt = _obs_box_pts(reference, o, o["half_len"] + AVOID_MARGIN,
+                            o["half_w"] + AVOID_MARGIN, h_full, o_ground)
+        add((255, 60, 60), _mbt[0] + _mbt[1], True)                    # 障碍·带余量
 
     for cam, full3d in ((inst, True), (bird, False)):
         tag = "bbox" if full3d else "bird"
@@ -357,6 +452,9 @@ def overlay_3d_boxes(*, vehicle, fused_loc, fused_yaw_deg, obstacles, reference,
             w, h = img.size
             draw = PIL.ImageDraw.Draw(img)
             for rec in records:
+                # 自车 3D 框只在鸟瞰画；右侧 RGB（full3d=inst）跳过自车
+                if rec.get("ego") and full3d:
+                    continue
                 pixels = _project_points(rec["pts"], vehicle, cam, w, h)
                 # 用投影线段同时支持「写回 JPEG」和「下发 payload 供 local_runner 画」
                 if full3d:
@@ -418,7 +516,7 @@ def build_sse_payload(*, t, wp_idx, route_wp, route_lane_ids, sampling_res,
                       brake, cte, loc_err, front_obstacle, arrived,
                       perception_on, perceived_count, gt_loc, gt_yaw,
                       ngx, ngy, plan, obs_list, planned_obstacles, tl,
-                      carla_map, viz3d=None):
+                      carla_map, viz3d=None, gap_viz=None):
     """组装 SSE 实验数据帧（前端零改动的兼容字段集）。
     plan: PlanOutput；tl: TlFrame。viz3d: overlay_3d_boxes 返回的 bbox/bird
     投影线段，供 local_runner 与车道线同通道即时绘制（避免 JPEG 闪烁）。"""
@@ -524,5 +622,6 @@ def build_sse_payload(*, t, wp_idx, route_wp, route_lane_ids, sampling_res,
             "fsm": plan.fsm_state,
             "bbox3d": (viz3d or {}).get("bbox", []),
             "bird3d": (viz3d or {}).get("bird", []),
+            "gap_viz": gap_viz or {"ego_req_w": 0.0, "sides": []},
         }
     }

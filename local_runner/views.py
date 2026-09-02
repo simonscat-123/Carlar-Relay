@@ -30,7 +30,10 @@ VIZ_PRED_LINE = True    # 预测轨迹（橙虚线）
 VIZ_OBSTACLE = False     # 障碍物块（红）
 VIZ_RANGE = False        # 感知范围圈（约 50m）
 VIZ_EGO_MARK = False     # 自车标记（中心圆点）
-VIZ_BBOX3D = True       # 3D 包围框（自车+障碍，真实实线/余量虚线）
+VIZ_BBOX3D = True       # 3D 包围框（自车真实+纯车宽参考虚线；障碍真实+余量虚线）
+VIZ_GAP_BAND = True     # 障碍两侧车身可容空间带（绿=带宽≥车宽/红=不够）+ 可容宽标注
+VIZ_EDGE_MARGIN = True  # 可容带外侧 EDGE 边界余量保留区（黄带 + 余量标注）
+VIZ_EGO_CLEAR = True    # 自车所需通过宽度标注（车宽 X.Xm）
 
 # 帧缓存：slot -> (b64, surface)，避免同一帧重复 JPEG 解码
 _FRAME_CACHE: dict = {}
@@ -362,7 +365,7 @@ def _lane_bboxes(lanes):
     return bbs
 
 
-def _draw_bird_overlay(screen, rect, exp, lanes):
+def _draw_bird_overlay(screen, rect, exp, lanes, font=None):
     """在鸟瞰相机画面上叠加车道 / 参考线 / 预测线 / 障碍物（对齐前端 drawLaneBev）。
 
     鸟瞰相机：960×960、FOV 90°、挂车顶 z=45 正下视 → 图像中心是自车，
@@ -501,6 +504,55 @@ def _draw_bird_overlay(screen, rect, exp, lanes):
     if VIZ_EGO_MARK:
         pygame.draw.circle(screen, (78, 139, 255), (int(cx), int(cy)), max(5, int(7 * s)), 1)
 
+    # 障碍两侧车身可容空间带（后端 build_gap_viz 下发，口径=simple_planner）+
+    # 可容宽标注；绿=带宽≥车宽(可过)，红=不够
+    if VIZ_GAP_BAND:
+        gv = exp.get("gap_viz") or {}
+        for sd in gv.get("sides") or []:
+            poly = [to_scr(p[0], p[1]) for p in sd.get("poly", [])]
+            if len(poly) < 3:
+                continue
+            if sd.get("pass"):
+                fill, stroke = (60, 210, 90, 70), (60, 210, 90)
+            else:
+                fill, stroke = (245, 63, 63, 70), (245, 63, 63)
+            band = pygame.Surface((rect[2], rect[3]), pygame.SRCALPHA)
+            pygame.draw.polygon(band, fill, poly)
+            pygame.draw.polygon(band, stroke, poly, 1)
+            screen.blit(band, (rect[0], rect[1]))
+            if font is not None:
+                lp = to_scr(sd["label"][0], sd["label"][1])
+                txt = font.render(f"{sd['width']:.1f}", True, stroke)
+                screen.blit(txt, (int(lp[0] - txt.get_width() / 2),
+                                  int(lp[1] - txt.get_height() / 2)))
+
+    # EDGE 边界余量保留区（可容带外侧 → 可行驶域边界，本车不会进入；黄带）
+    if VIZ_EDGE_MARGIN:
+        gv = exp.get("gap_viz") or {}
+        for sd in gv.get("sides") or []:
+            ep = sd.get("edge_poly") or []
+            if len(ep) < 3:
+                continue
+            poly = [to_scr(p[0], p[1]) for p in ep]
+            band = pygame.Surface((rect[2], rect[3]), pygame.SRCALPHA)
+            pygame.draw.polygon(band, (255, 200, 60, 45), poly)
+            pygame.draw.polygon(band, (255, 200, 60), poly, 1)
+            screen.blit(band, (rect[0], rect[1]))
+            # if font is not None:
+            #     mx = sum(p[0] for p in poly) / len(poly)
+            #     my = sum(p[1] for p in poly) / len(poly)
+            #     txt = font.render(f"余量 {sd.get('edge_margin', 0):.0f}m",
+            #                       True, (255, 200, 60))
+            #     screen.blit(txt, (int(mx - txt.get_width() / 2),
+            #                       int(my - txt.get_height() / 2)))
+
+    # 自车车宽标注（真实框宽度 = 2×ego_half_w；与可容带带宽对比判断能否通过）
+    if VIZ_EGO_CLEAR and font is not None:
+        req_w = (exp.get("gap_viz") or {}).get("ego_req_w")
+        if req_w:
+            txt = font.render(f"车宽 {req_w}m", True, (0, 200, 255))
+            screen.blit(txt, (int(cx) + 10, int(cy) + 8))
+
 
 def render_comprehensive(screen, fonts, surfaces, exp, hist: TelemetryHistory, ctx):
     w, h = screen.get_size()
@@ -513,7 +565,7 @@ def render_comprehensive(screen, fonts, surfaces, exp, hist: TelemetryHistory, c
     if bird is not None:
         _blit_cover(screen, bird, bird_rect)
         if exp.get("status") == "running":
-            _draw_bird_overlay(screen, bird_rect, exp, ctx.get("lanes") or [])
+            _draw_bird_overlay(screen, bird_rect, exp, ctx.get("lanes") or [], fonts["sm"])
             # 3D 框投影线段：与车道线同通道即时绘制，稳定不闪
             if VIZ_BBOX3D:
                 _overlay_segs(screen, bird_rect, bird.get_size(), exp.get("bird3d"))

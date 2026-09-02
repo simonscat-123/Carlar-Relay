@@ -40,7 +40,7 @@ from carla_relay.experiments.comprehensive_driving.control import VehicleControl
 from carla_relay.experiments.comprehensive_driving.control_v2 import VehicleControllerV2
 from carla_relay.experiments.comprehensive_driving.viz import (
     render_bbox_overlay, render_semantic_frame, build_sse_payload,
-    overlay_3d_boxes,
+    overlay_3d_boxes, build_gap_viz,
 )
 from carla_relay.experiments.comprehensive_driving.actors import (
     spawn_obstacle_ahead, refresh_route_obstacles, clear_obstacles,
@@ -662,6 +662,14 @@ def _run_exp10(args):
                                   _label_semantic_level, _colors_from_labels)
 
             # 推送实验数据（可视化层组装：鸟瞰车道/参考线/预测轨迹 + 状态帧）
+            # 障碍两侧可通行间隙带（口径与 simple_planner 一致 → 所见即决策）。
+            # 纯可视化：任何异常不得影响驾驶主循环。
+            try:
+                _gap_viz = build_gap_viz(reference, perc.obstacles, ego_half_w,
+                                         ego_half_len, ego_s=ego_s,
+                                         aggressive_on=aggressive_on, log=_both_log)
+            except Exception:
+                _gap_viz = None
             _push_to_sse(build_sse_payload(
                 t=t, wp_idx=wp_idx, route_wp=route_wp, route_lane_ids=route_lane_ids,
                 sampling_res=sampling_res, fused_loc=loc.fused_loc,
@@ -672,7 +680,7 @@ def _run_exp10(args):
                 perceived_count=len(perc.perceived), gt_loc=gt_loc, gt_yaw=gt_yaw,
                 ngx=loc.ngx, ngy=loc.ngy, plan=plan, obs_list=perc.obs_list,
                 planned_obstacles=_EXP10_PLANNED_OBSTACLES, tl=tl, carla_map=carla_map,
-                viz3d=_viz3d))
+                viz3d=_viz3d, gap_viz=_gap_viz))
 
             # 同步模式下 tick 已按固定时间步推进并阻塞至该帧完成，无需额外 sleep
             # time.sleep(0.05)  # 20fps
