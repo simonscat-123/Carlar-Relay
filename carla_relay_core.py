@@ -414,7 +414,7 @@ _load_comprehensive_driving_fragments(globals())
 
 # =============================================================================
 # 综合驾驶（闭环自动驾驶，API 实验ID 10）→ P4 已迁移至
-# carla_relay/experiments/comprehensive_driving_*.py
+# carla_relay/experiments/comprehensive_driving/（分层真实模块 + run.py 薄编排片段）
 # =============================================================================
 
 

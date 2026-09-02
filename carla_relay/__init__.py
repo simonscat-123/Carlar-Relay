@@ -8,10 +8,10 @@
     core/           CARLA 客户端、传感器装配、SSE hub
     perception/     语义分割解析
     routes/         健康检查 / 同步 / 车辆 / 传感器 / 流 / 杂项蓝图
-    experiments/    实验逻辑 + 共享状态 + 控制器（命名对齐前端关卡：
-                    localization 定位分析 / lidar_detection Lidar 检测 /
-                    semantic_segmentation 语义分割 / comprehensive_driving_* 综合驾驶
-                    + 历史实验）
+    experiments/    实验逻辑（common/ 通用逻辑 + 各实验名文件夹；
+                    命名对齐前端关卡：localization 定位分析 /
+                    lidar_detection Lidar 检测 / semantic_segmentation 语义分割 /
+                    comprehensive_driving 综合驾驶 + 历史实验）
     world_api/      感知查询 / 路径规划 / 地图 / 行人 / 俯瞰 API
 
 experiments/ 与 world_api/ 内的 .py 为命名空间片段：由引导壳经
