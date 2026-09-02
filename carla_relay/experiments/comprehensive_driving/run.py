@@ -32,6 +32,9 @@ from carla_relay.experiments.comprehensive_driving.prediction import ObstaclePre
 from carla_relay.experiments.comprehensive_driving.planner import (
     TrajectoryPlanner, RED_MARGIN, MAX_DECEL,
 )
+from carla_relay.experiments.comprehensive_driving.simple_planner import (
+    SimplePlanner,
+)
 from carla_relay.experiments.comprehensive_driving.control import VehicleController
 from carla_relay.experiments.comprehensive_driving.viz import (
     render_bbox_overlay, render_semantic_frame, build_sse_payload,
@@ -110,6 +113,13 @@ def _run_exp10(args):
             "perception": 1.0 if perception_mode else 0.0,
             "aggressive": 1.0 if aggressive_mode else 0.0,
         })
+    # 规划器选择：simple=单一几何避障（方案B，构造性生成+地图级校验）；
+    # legacy=采样式时空联合规划（默认，保持旧行为）
+    planner_kind = str(args.get("planner", "legacy")).lower()
+    if planner_kind not in ("simple", "legacy"):
+        planner_kind = "legacy"
+    _exp_log(f"规划器: {planner_kind}"
+             f"{'（单一几何避障）' if planner_kind == 'simple' else '（FSM+采样式规划）'}")
     gps_failure = bool(args.get("gps_failure", False))
     spawn_pedestrian = bool(args.get("spawn_pedestrian", False))
     sampling_res = float(args.get("sampling_resolution", 2.0))
@@ -335,8 +345,12 @@ def _run_exp10(args):
         predictor = ObstaclePredictor()
         perceiver = Perceiver(reference, world, carla_map, _exp_log, _dynamic_class,
                               RED_MARGIN, tl_bindings, _TL_STATE_MAP, _plan_log)
-        planner = TrajectoryPlanner(reference, predictor, _exp_log, _plan_log,
+        if planner_kind == "simple":
+            planner = SimplePlanner(reference, predictor, _exp_log, _plan_log,
                                     ego_half_w, ego_half_len)
+        else:
+            planner = TrajectoryPlanner(reference, predictor, _exp_log, _plan_log,
+                                        ego_half_w, ego_half_len)
         controller = VehicleController(kp_steer, lookahead, steer_delay,
                                        brake_force, MAX_DECEL)
 
@@ -373,6 +387,7 @@ def _run_exp10(args):
             "safe_dist": safe_dist, "gnss_noise": gnss_noise, "ins_noise": ins_noise,
             "alpha": alpha, "perception": perception_mode, "aggressive": aggressive_mode,
             "gps_failure": gps_failure, "sampling_res": sampling_res,
+            "planner": planner_kind,
         }
 
         # 7. 主循环（编排：tick → 定位 → 感知 → 规划 → 控制 → 可视化/推送）
@@ -471,6 +486,8 @@ def _run_exp10(args):
                     _plan_log(
                         f"PRED obs={_o['id'] if _o['id'] is not None else '-'} "
                         f"cat={_cat} cls={_o['cls']} "
+                        f"pos=(s{_o['s']:.1f},l{_o['l']:+.1f}) "
+                        f"size={2 * _o['half_len']:.1f}x{2 * _o['half_w']:.1f}m "
                         f"cand={_psum['n_cand']}pt "
                         f"best(prob={_b['prob']:.2f}) s={_b['s_start']:.1f}→{_b['s_end']:.1f} "
                         f"{_shape}")
@@ -485,18 +502,26 @@ def _run_exp10(args):
             vel = vehicle.get_velocity()
             spd = math.sqrt(vel.x ** 2 + vel.y ** 2)
             ego_s, ego_l, ego_tx, ego_ty = reference.frenet(
-                loc.fused_loc.x, loc.fused_loc.y, _scan_j0, _scan_j1)
+                loc.fused_loc.x, loc.fused_loc.y, _scan_j0, _scan_j1, track=True)
             v_long = max(0.0, vel.x * ego_tx + vel.y * ego_ty)   # 纵向车速（沿参考线）
 
             # ── 感知层：信号灯状态（停止线绑定 + s 判定，输出 TlFrame）──
             tl = perceiver.read_traffic_light(ego_s)
 
             # ── 规划层：决策 + 时空联合规划（输出 PlanOutput：轨迹 + 期望 + 可视化状态）──
+            # 航向-参考线夹角（日志增强#5）：自车航向 vs 参考线切向。拐点重关联
+            # 处该角会瞬间跳变（配合 FRM 的 yaw_e 字段暴露坐标系不连续）。
+            # CARLA yaw 为度、左手系：atan2 交叉项取 (tx·sinθ − ty·cosθ)
+            _yaw_rad = math.radians(loc.fused_yaw_deg)
+            _yaw_err = math.degrees(math.atan2(
+                ego_tx * math.sin(_yaw_rad) - ego_ty * math.cos(_yaw_rad),
+                ego_tx * math.cos(_yaw_rad) + ego_ty * math.sin(_yaw_rad)))
             plan = planner.step(
                 t=t, spd=spd, v_long=v_long, ego_s=ego_s, ego_l=ego_l,
                 obstacles=perc.obstacles, tl=tl, aggressive_on=aggressive_on,
                 target_speed=target_speed, safe_dist=safe_dist, wp_idx=wp_idx,
-                prev_thr=controller.prev_thr, prev_brk=controller.prev_brk)
+                prev_thr=controller.prev_thr, prev_brk=controller.prev_brk,
+                yaw_err_deg=_yaw_err)
 
             # ── 控制层：纵向 PI + 横向 Pure Pursuit（输出 CtrlOutput：转向/油门/刹车）──
             ctrl = controller.step(

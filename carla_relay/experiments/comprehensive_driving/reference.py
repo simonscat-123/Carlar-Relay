@@ -34,20 +34,77 @@ class ReferenceLine:
         for _j in range(1, len(route_wp)):
             self.s_tab.append(self.s_tab[-1] + route_wp[_j].distance(route_wp[_j - 1]))
         self._bounds_cache = {}
+        # ── frenet 关联稳定化（修路口拐点跳变）──
+        # 问题：最近点搜索在急弯/路口处，路线「回头」时（u 形弯、发卡弯，
+        # 或转弯前后两段在空间上贴近），自车可能距「转弯后路段」比距「当前
+        # 段」更近 → 关联一帧跳到未来路段 → s 突进 / l 突变 / 可行驶域翻转，
+        # 进行中的绕行/换道剖面被直接杀死（三次实测均栽在此）。
+        # 对策（track=True，仅供主循环自车位姿调用）：
+        #   1) 窗口 = [上次关联点 - 15点, +前向 FRENET_FWD m]，只允许在当前
+        #      段附近搜索，物理上不可能跳到远处路段；
+        #   2) 候选须比当前关联点近 FRENET_HYST（滞回），定位噪声不触发切换；
+        #   3) 窗口内允许双向移动（后向 15 点 ≈ 一帧内物理不可能走完的
+        #      距离，倒车/校正仍可用）。
+        # track=False（默认）：无状态投影，行为与旧实现完全一致——停止线
+        # 绑定 / 障碍物扫描等任意位置调用不得污染自车跟踪状态（否则首帧
+        # 关联会被停止线位置锚死，自车坐标系整体错位）。
+        self._frenet_j = None          # 上次自车关联的最近路点索引
 
     # ── 坐标变换 ─────────────────────────────────────────────────────────
-    def frenet(self, px, py, j0=0, j1=None):
-        """世界坐标 → Frenet (s, l, 切向tx, 切向ty)。
-        在 [j0, j1) 路点窗口内找最近路点，s = 弧长 + 切向投影，
-        l = 相对切线的横向偏移（左正，与控制层约定一致）。"""
+    # 前向搜索距离：局部窗口上界。须覆盖两次调用间最大位移（车速上限 × 帧距）
+    # 留余量即可——过大窗口会重新引入拐点跳变风险
+    FRENET_FWD_M = 30.0
+    # 切换滞回（m²·距离平方）：候选须比当前关联点近此余量才允许前进切换，
+    # 定位噪声（±0.25m）不触发关联点抖动
+    FRENET_HYST_D2 = 0.5 ** 2
+
+    def frenet(self, px, py, j0=0, j1=None, track=False):
+        """世界坐标 → Frenet (s, l, 切向tx, 切向ty)。s = 弧长 + 切向投影，
+        l = 相对切线的横向偏移（左正，与控制层约定一致）。
+
+        track=False（默认）：无状态窗口投影——[j0, j1) 内全局最近点，与
+        旧实现完全一致。停止线绑定 / 障碍物扫描等任意位置调用必须用此模式
+        （不更新内部关联状态，防止污染自车跟踪锚点）。
+        track=True：自车位姿专用——稳定关联（局部窗口 + 滞回，见 __init__
+        注释），修路口拐点处关联跳到未来路段导致 s/l 突变、域翻转、绕行
+        剖面被杀的问题。仅 run.py 主循环自车位姿调用。"""
         route_wp = self.route_wp
         if j1 is None:
             j1 = len(route_wp)
-        best_j, best_d2 = j0, float("inf")
-        for j in range(j0, j1):
-            d2 = (px - route_wp[j].x) ** 2 + (py - route_wp[j].y) ** 2
-            if d2 < best_d2:
-                best_d2, best_j = d2, j
+        if track:
+            # ── 稳定关联模式（自车专用）──
+            if self._frenet_j is None:
+                best_j, best_d2 = j0, float("inf")
+                for j in range(j0, j1):
+                    d2 = (px - route_wp[j].x) ** 2 + (py - route_wp[j].y) ** 2
+                    if d2 < best_d2:
+                        best_d2, best_j = d2, j
+                self._frenet_j = best_j
+            else:
+                # 窗口 = [上次关联 - 15点, +前向 FRENET_FWD_M 弧长]；
+                # 后向 15 点覆盖控制层 wp_idx 校正滞后与倒车场景
+                _lo = max(0, self._frenet_j - 15)
+                _s_hi = self.s_tab[min(len(route_wp) - 1, self._frenet_j)] \
+                    + self.FRENET_FWD_M
+                _hi = _lo
+                while (_hi < len(route_wp) - 1
+                       and self.s_tab[_hi + 1] <= _s_hi):
+                    _hi += 1
+                best_j = self._frenet_j
+                best_d2 = ((px - route_wp[best_j].x) ** 2
+                           + (py - route_wp[best_j].y) ** 2)
+                for j in range(max(_lo, j0), min(_hi + 1, j1)):
+                    d2 = (px - route_wp[j].x) ** 2 + (py - route_wp[j].y) ** 2
+                    if d2 < best_d2 - self.FRENET_HYST_D2:
+                        best_d2, best_j = d2, j
+                self._frenet_j = best_j
+        else:
+            # ── 无状态投影模式（旧实现行为）──
+            best_j, best_d2 = j0, float("inf")
+            for j in range(j0, j1):
+                d2 = (px - route_wp[j].x) ** 2 + (py - route_wp[j].y) ** 2
+                if d2 < best_d2:
+                    best_d2, best_j = d2, j
         a = route_wp[max(0, best_j - 1)]
         b = route_wp[min(len(route_wp) - 1, best_j + 1)]
         tx, ty = b.x - a.x, b.y - a.y
@@ -184,6 +241,43 @@ class ReferenceLine:
             dx = wp2.transform.location.x - px
             dy = wp2.transform.location.y - py
             return math.hypot(dx, dy) < 1.5
+        except Exception:
+            return False
+
+    def lat_driving_fwd(self, l_t, s_probe):
+        """该偏移点是否落在「同向 Driving 车道」上（地图级 + 投影距离校验）。
+
+        供轨迹逐点域校验的过渡段兜底：S 式换道过渡处参考线从旧车道中心
+        切到新车道中心，drivable_bounds 缓存的域边界相对「当地车道中心」
+        计量，而轨迹横向偏移 l 相对「连续参考曲线」——两坐标系在过渡段
+        错位可达数米，直接比较会把本可通行的剖面误判越界。此方法把
+        (s, l) 经连续参考曲线转回世界坐标后直接问地图，不受坐标系错位
+        影响；投影距离过远（草坪/远处邻路）与对向车道（前向点积≤0.3）
+        均判不可行。"""
+        try:
+            px, py = self.world(s_probe, l_t)
+            wp2 = self.carla_map.get_waypoint(
+                carla.Location(x=px, y=py, z=0.0),
+                project_to_road=True, lane_type=carla.LaneType.Driving)
+            if wp2 is None:
+                return False
+            dx = wp2.transform.location.x - px
+            dy = wp2.transform.location.y - py
+            if math.hypot(dx, dy) >= 1.5:
+                return False
+            s_tab = self.s_tab
+            lo, hi = 0, len(s_tab) - 1
+            while hi - lo > 1:
+                mid = (lo + hi) // 2
+                if s_tab[mid] <= s_probe:
+                    lo = mid
+                else:
+                    hi = mid
+            a = self.route_wp[max(0, lo - 1)]
+            b = self.route_wp[min(len(self.route_wp) - 1, lo + 1)]
+            tx, ty = b.x - a.x, b.y - a.y
+            f = wp2.transform.get_forward_vector()
+            return (f.x * tx + f.y * ty) > 0.3
         except Exception:
             return False
 

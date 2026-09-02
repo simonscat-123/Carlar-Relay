@@ -73,11 +73,23 @@ class TrajectoryPlanner:
         self._borrow_prev = False        # 上一帧是否激进借道——开始/结束事件检测
         self._avoid_prev = False       # 上一帧是否换道中——转换日志用
         self._nudge_active = False     # 上一帧是否贴边绕行中——空隙门槛滞回用
-        self._nudge_prev = False      # 上一帧最优解是否 nudge——开始/结束事件检测
+        self._nudge_prev = False      # 上一帧最优解是否 nudge——开始/结束事件检测用
+        # nudge 承诺锁存：(t, 最近一次 _find_nudge 成功结果)。绕行中途空隙
+        # 判定瞬时空转时沿用，防候选闪断 → 兜底刹停 → 死锁振荡（见 step()）
+        self._nudge_last = None
         # 意图失效降级状态（修死锁，见 INTENT_FAIL_N 注释）
         self._intent_fail_cnt = 0     # intent 候选连续无幸存帧数
         self._intent_fail_key = None  # 计数对应的 intent 值（换目标即重置）
         self._intent_latch_t = None   # 降级锁存起始时刻（None=未锁存）
+        # 参考线跳变检测（上一帧位姿）：帧间 Δs 远超车速×Δt 或 Δl 突变，
+        # 即参考线在路口拐点重关联到新路段（s/l/域全部不连续）——两次实测
+        # 均在机动中途杀死绕行剖面，是当前最高优先级异常源
+        self._prev_pose = None        # (t, ego_s, ego_l, v_long)
+        # 停止线-障碍重叠事件检测（上一帧是否重叠）
+        self._tl_obs_prev = False
+        # nudge 空隙诊断（_find_nudge 每帧填充，CAND 表头用）：全部自由
+        # 区间与所需宽度——「为什么选左不选右」「为什么没绕」直接可答
+        self._nudge_diag = None
         self.fsm_state = "CRUISE"        # 行为状态标签：CRUISE/APPROACH_RED/FOLLOW/LANE_CHANGE/NUDGE
 
     @staticmethod
@@ -120,7 +132,14 @@ class TrajectoryPlanner:
                for o in obstacles
                if o["s"] - o["half_len"] < ego_s + DEC_WIN
                and o["s"] + o["half_len"] > ego_s - 2.0]
-        # 本车可用横向边界（可行驶域边界内收路缘余量）
+        # 本车可用横向边界：取「最近阻挡障碍横截面」处的当地可行驶域（与
+        # 逐点硬约束同源），而非自车/前视点处的域——S 弯过渡/前视点跨段时
+        # 两者错位，会探测出校验侧过不去的空隙（实测：v=0 时候选靠 ego_l
+        # 豁免幸存、v>0 时轨迹前进即被拒 → 刹停-爬行-再拒循环振荡）。取不
+        # 到当地域时退回当前域
+        _b_blk = self._ref.bounds_at_s(min(o["s"] for o in blockers))
+        if _b_blk is not None and _b_blk[0] is not None:
+            l_min, l_max = _b_blk
         lo = l_min + self._ego_half_w + NUDGE_MARGIN_EDGE
         hi = l_max - self._ego_half_w - NUDGE_MARGIN_EDGE
         if lo >= hi:
@@ -129,8 +148,13 @@ class TrajectoryPlanner:
         need = 2.0 * (self._ego_half_w + NUDGE_MARGIN_EGO)
         if self._nudge_active:
             need -= NUDGE_HYST
+        # 诊断：全部自由区间（含不可用者），CAND 表头输出——回答
+        # 「有哪些空隙/各多宽/为什么没选或没绕」
+        self._nudge_diag = {
+            "gaps": [(a, b) for a, b in self._free_intervals(occ, lo, hi)],
+            "need": need}
         best_gap = None
-        for a, b in self._free_intervals(occ, lo, hi):
+        for a, b in self._nudge_diag["gaps"]:
             if b - a >= need:
                 c = (a + b) / 2.0
                 if best_gap is None or abs(c - ego_l) < abs(best_gap[0] - ego_l):
@@ -144,27 +168,30 @@ class TrajectoryPlanner:
         # 误杀剖面；且停死后定位噪声 ±0.25m 反复穿越 0.3 阈值导致闪断
         committed = abs(ego_l) > 0.5
         # ── shift 点横向剖面（Autoware avoidance 式）：
-        # 贴边渐变（须在到达最靠后障碍后缘前完成）→ 穿越保持 →
-        # 车尾超过最前障碍头部 return_x 后渐变回道
+        # 贴边渐变 → 穿越保持 → 车尾超过最前障碍头部 return_x 后渐变回道
         s_rear = min(o["s"] - o["half_len"] for o in blockers)
         s_front = max(o["s"] + o["half_len"] for o in blockers)
         ramp = max(NUDGE_RAMP_MIN, 1.5 * v_long)
-        s_shift_end = s_rear - 0.5          # 贴边完成点（留 0.5m 提前量）
-        # 距离校验仅在「尚未离开本道」时生效；距离不足但仍有空间时压缩渐变
-        # 段而非直接放弃（慢速下 2m 渐变仍平缓，逐点硬约束兜底安全性）
+        # 贴边完成期限：进入阻挡障碍「碰撞包络」前必须完成横向分离——包络
+        # 前缘 = 障碍后缘 − 本车半长 − 纵向余量（再留 0.5m）。完成点晚于
+        # 此处，剖面会斜穿包络对角线（纵向已入包络、横向尚未分开），被逐点
+        # 碰撞硬约束整条拒掉：CRUISE/NDG 全灭、仅 v≈0 的 STOP/NDG 靠轨迹
+        # 不前进苟活 → 刹停-爬行循环卡死在障碍正前方（实测主因之二）。
+        # 旧完成点 s_rear−0.5 比包络前缘晚 3m+，从未正确过
+        s_shift_end = s_rear - self._ego_half_len - COLL_S - 0.5
         _avail = s_shift_end - ego_s
-        if _avail < ramp and not committed:
+        if _avail < ramp:
+            # 距离不足：压缩渐变段（重锚到当前位置，兼修 v≈0 死锁恢复——
+            # 重锚后 lat(s) 从 ego_l 平滑渡到空隙中心，无剖面跳变）
             if _avail >= NUDGE_RAMP_MIN_S:
                 ramp = _avail               # 压缩渐变段，贴边更陡但可行
+            elif committed:
+                ramp = NUDGE_RAMP_MIN_S     # 已横移中：尽力陡移，硬约束兜底
             else:
                 return None                 # 太近且未横移：跟停兜底
+            s_shift_end = ego_s + ramp
         ret_x = max(NUDGE_RETURN_X, 0.5 * v_long)   # 相对速度越快回道余量越大
         s_ret_start = s_front + ret_x + self._ego_half_len
-        # 已越过渐变段起点（含 v≈0 死锁恢复）：渐变段重锚到当前位置——否则
-        # lat(s) 对所有未来 s 直接返回 gap_l，剖面跳变；重锚后从当前位置
-        # 平滑渡到空隙中心，原地爬行（a>0）时横移随 s 推进
-        if committed and ego_s > s_shift_end - ramp:
-            s_shift_end = ego_s + ramp
 
         def lat(s):
             if s <= s_shift_end - ramp:
@@ -183,17 +210,53 @@ class TrajectoryPlanner:
 
     def step(self, *, t, spd, v_long, ego_s, ego_l, obstacles, tl,
              aggressive_on, target_speed, safe_dist, wp_idx,
-             prev_thr, prev_brk) -> PlanOutput:
+             prev_thr, prev_brk, yaw_err_deg=None) -> PlanOutput:
         ref = self._ref
         plan_log = self._plan_log
         red_stop_s = tl.red_stop_s
         tl_state = tl.state
         tl_dist = tl.dist
 
+        # ── 参考线跳变检测（日志增强#2/#8）：帧间 Δs 远超车速×Δt（物理不可
+        # 能）或 Δl 突变 → 参考线在路口拐点重关联。两次实测均在机动中途发生，
+        # s/l/可行驶域全部不连续（域镜像翻转、自车 l 一帧跳 1.7m），直接
+        # 杀死进行中的绕行/换道剖面。打事件时带上 road/lane id 便于定位
+        # 重关联发生在哪个路段
+        if self._prev_pose is not None:
+            _pt, _ps, _pl, _pv = self._prev_pose
+            _dt = max(1e-3, t - _pt)
+            _ds_ex = _pv * _dt
+            _ds_act = ego_s - _ps
+            _dl = ego_l - _pl
+            if (abs(_ds_act - _ds_ex) > 1.0 or abs(_dl) > 1.0):
+                _wp_l = "无"
+                try:
+                    _wp_cur = ref.route_wps[wp_idx] if wp_idx < len(ref.route_wps) else None
+                    if _wp_cur is not None:
+                        _wp_l = f"road{_wp_cur.road_id}/lane{_wp_cur.lane_id}"
+                except Exception:
+                    pass
+                plan_log(f"EVENT 参考线跳变: Δs={_ds_act:+.2f}m(预期{_ds_ex:+.2f}m) "
+                         f"Δl={_dl:+.2f}m v={_pv:.1f}m/s wp={wp_idx} 车道={_wp_l} "
+                         f"——疑似路口重关联，剖面/域不连续")
+        self._prev_pose = (t, ego_s, ego_l, v_long)
+
+        # ── 停止线-障碍重叠事件（日志增强#7）：障碍停在红灯停止线上（或极近）
+        # 时，横向可通过也过不去——显式绑定两个 s，避免人肉对齐才发现
+        _tl_obs = (red_stop_s is not None and any(
+            abs(o["s"] - red_stop_s) < o["half_len"] + 2.0 for o in obstacles))
+        if _tl_obs and not self._tl_obs_prev:
+            _o_tl = min(obstacles, key=lambda o: abs(o["s"] - red_stop_s))
+            plan_log(f"EVENT 停止线被障碍占用: 红灯停止线 s={red_stop_s:.1f}m 与 "
+                     f"障碍(s={_o_tl['s']:.1f}, l={_o_tl['l']:+.1f}) 重叠——"
+                     f"横向通过也会被红灯封死")
+        self._tl_obs_prev = _tl_obs
+
         # ── 刹停余量（safe_distance 滑杆联动，默认12→6m）──
         STOP_MARGIN = max(3.0, safe_dist * 0.5)
         a_need = 0.0
         desired = target_speed
+        self._nudge_diag = None   # 本帧空隙诊断（_find_nudge 触发时填充）
 
         # 可行驶域 + 车道宽度（无车道信息时退化为「只保持车道」的安全模式）
         bnds = ref.drivable_bounds(wp_idx) if wp_idx < len(ref.route_wp) else None
@@ -285,9 +348,18 @@ class TrajectoryPlanner:
                 _intent_degraded = True
                 if self._intent_latch_t is None:
                     self._intent_latch_t = t
+                    _wp_l = "无"
+                    try:
+                        _wp_cur = (ref.route_wps[wp_idx]
+                                   if wp_idx < len(ref.route_wps) else None)
+                        if _wp_cur is not None:
+                            _wp_l = f"road{_wp_cur.road_id}/lane{_wp_cur.lane_id}"
+                    except Exception:
+                        pass
                     plan_log(f"EVENT 意图失效降级: 邻道 {intent_l:+.1f}m 换道候选连续 "
                              f"{INTENT_FAIL_N} 帧被硬约束拒绝，判定不可达；"
-                             f"放行贴边绕行/借道分支，{INTENT_RETRY_S:.0f}s 后重试")
+                             f"放行贴边绕行/借道分支，{INTENT_RETRY_S:.0f}s 后重试 "
+                             f"（wp={wp_idx} 车道={_wp_l}）")
                 intent_l = 0.0
         # ── 贴边绕行（nudge）决策：先于激进借道（路内空隙比对向借道安全）。
         # 触发条件：本道被堵 + 无同向邻道可换（intent_l==0，含「邻道不存在」
@@ -296,6 +368,15 @@ class TrajectoryPlanner:
         nudge = None
         if _blocked and intent_l == 0.0:
             nudge = self._find_nudge(obstacles, ego_s, ego_l, v_long, l_min, l_max)
+            # 承诺锁存（防御）：绕行中途（已离开本道）空隙判定瞬时空转时，
+            # 沿用 1.5s 内的上一帧剖面——速度/定位噪声让 nudge 候选闪断会
+            # 触发兜底刹停 → 死锁振荡。安全性仍由逐点碰撞硬约束兜底
+            if nudge is not None:
+                self._nudge_last = (t, nudge)
+            elif (self._nudge_active and abs(ego_l) > 0.5
+                    and self._nudge_last is not None
+                    and t - self._nudge_last[0] < 1.5):
+                nudge = self._nudge_last[1]
         # 激进模式兜底：本道被占且无同向邻道可绕（单车道+对向道、或邻接链
         # 断裂致边界收缩）→ 借邻接车道绕行（通常是对向道）。目标偏移取
         # 邻接车道中心（相对参考线），走廊须无障碍；轨迹层逐点校验仍在
@@ -457,11 +538,20 @@ class TrajectoryPlanner:
                             b_k = (l_min, l_max)
                         if (l_k < min(b_k[0] + self._ego_half_w + COLL_L, ego_l - 0.05)
                                 or l_k > max(b_k[1] - self._ego_half_w - COLL_L, ego_l + 0.05)):
-                            _rej_bounds += 1
-                            _why = "域"
-                            _rej_pt = (tk, s_k, l_k)
-                            ok = False
-                            break
+                            # 过渡段域错位兜底（修绕行振荡死锁，实测根因）：
+                            # S 式换道过渡处参考线已切到新车道中心，缓存域边界
+                            # 相对「当地车道中心」计量，而 l_k 相对「连续参考
+                            # 曲线」——两坐标系在过渡段错位可达数米，逐点比较
+                            # 把本可通行的绕行/换道剖面误拒（v>0 时轨迹前进即
+                            # 触发、v=0 时靠 ego_l 豁免幸存 → 刹停-爬行循环）。
+                            # 改用地图级同向 Driving 校验裁决（世界坐标，免疫
+                            # 坐标系错位）；路缘/对向仍被正确拒绝
+                            if not ref.lat_driving_fwd(l_k, s_k):
+                                _rej_bounds += 1
+                                _why = "域"
+                                _rej_pt = (tk, s_k, l_k)
+                                ok = False
+                                break
                     # 硬约束②：红灯（CRUISE 不得带速越过停止线）
                     if (mode == "CRUISE" and red_stop_s is not None
                             and s_k > red_stop_s and v_k > 0.3):
@@ -627,11 +717,22 @@ class TrajectoryPlanner:
         _obs_str = ",".join(f"{o['s']:.0f}/{o['l']:+.1f}" for o in obstacles[:3])
         _cost_str = f"/c={best['cost']:.2f}" if best is not None else ""
         _ndg_str = f"Y({nudge['gap']:.1f}m)" if _best_nudge else "N"
+        # nudge 剖面跟踪误差（日志增强#6）：当前 s 处剖面目标横向 vs 实际
+        # ego_l——区分「规划要偏」与「跟踪丢了」（上次绕行后 l 漂移 −2.4→−4.3
+        # 无法归因就是因为缺这个数）
+        _ndg_trk = ""
+        if nudge is not None:
+            _tgt_l = nudge["lat"](ego_s)
+            _ndg_trk = f" ndgT={_tgt_l:+5.2f} err={ego_l - _tgt_l:+5.2f}"
+        # 参考线-自车航向夹角（日志增强#5）：拐点重关联处该角会瞬间跳变，
+        # 直接暴露坐标系不连续
+        _yaw_str = f" yaw_e={yaw_err_deg:+6.1f}" if yaw_err_deg is not None else ""
         plan_log(
             f"FRM t={t:6.1f} v={spd:5.2f}(lon {v_long:5.2f}) s={ego_s:7.1f} l={ego_l:+5.2f} "
+            f"wp={wp_idx}{_yaw_str} "
             f"tl={tl_state[:3]}/{tl_dist:5.1f}m obs={len(obstacles)}[{_obs_str}] "
             f"blk={'Y' if _blocked else 'N'} agm={'Y' if aggressive_on else 'N'} "
-            f"bor={'Y' if borrow_l is not None else 'N'} ndg={_ndg_str} "
+            f"bor={'Y' if borrow_l is not None else 'N'} ndg={_ndg_str}{_ndg_trk} "
             f"itn={_intent_raw:+5.2f} dg={'Y' if _intent_degraded else 'N'} "
             f"itf={self._intent_fail_cnt}/{INTENT_FAIL_N} "
             f"nb={[round(x, 1) for x in _neighbors]} "
@@ -649,12 +750,21 @@ class TrajectoryPlanner:
         _bnd = f"[{l_min:+.1f},{l_max:+.1f}]" if l_min is not None else "无"
         _nud = (f"Y(空隙{nudge['gap']:.1f}m@{nudge['l']:+.1f}m)" if nudge is not None
                 else "N")
+        # 空隙全景（日志增强#4）：全部自由区间 + 所需宽度。回答「为什么选左
+        # 不选右」「有哪些空隙但太窄没绕」。无 nudge 触发但本帧被堵时同样
+        # 输出（若 _find_nudge 已跑过），空隙仲裁一目了然
+        _gaps_str = ""
+        if self._nudge_diag is not None:
+            _g = self._nudge_diag["gaps"]
+            _gaps_str = (" 空隙=" + (",".join(f"({a:+.1f},{b:+.1f})宽{b - a:.1f}"
+                                             for a, b in _g) if _g else "无")
+                         + f" 需宽{self._nudge_diag['need']:.1f}m")
         plan_log(
             f"CAND t={t:6.1f} blk={'Y' if _blocked else 'N'} "
             f"itn={_intent_raw:+.2f}{'(已降级)' if _intent_degraded else ''} "
             f"itf={self._intent_fail_cnt}/{INTENT_FAIL_N} "
             f"nb={[round(x, 1) for x in _neighbors]} 域={_bnd} "
-            f"T_lat={T_lat:.1f}s ndg={_nud} 存活={len(cands)}")
+            f"T_lat={T_lat:.1f}s ndg={_nud}{_gaps_str} 存活={len(cands)}")
         for _i, e in enumerate(_cand_dbg, 1):
             if isinstance(e, str):
                 plan_log(f"  cand{_i}: {e}")

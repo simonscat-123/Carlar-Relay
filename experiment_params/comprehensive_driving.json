@@ -16,6 +16,7 @@
     "alpha": 0.08,
     "sampling_resolution": 2.0,
     "perception": false,
-    "aggressive": true
+    "aggressive": true,
+    "planner": "simple"
   }
 }

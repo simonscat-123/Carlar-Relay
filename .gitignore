@@ -4,3 +4,4 @@ __pycache__/
 
 # 实验记录
 output/
+*.log
