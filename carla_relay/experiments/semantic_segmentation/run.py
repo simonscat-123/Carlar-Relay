@@ -12,6 +12,49 @@ from carla_relay.experiments.semantic_segmentation.bev import BevBuilder as _exp
 from carla_relay.experiments.semantic_segmentation.grid_planner import GridPlanner as _exp5_GridPlanner
 from carla_relay.experiments.comprehensive_driving.viz import render_perceived_frame as _exp5_render_perceived
 
+import math as _math5
+
+
+def _exp5_actor_metrics(world, ego, aid, t, vel_state, still_cnt):
+    """由真实 actor id 反查完整物理量：pose(全局 xyz/自身 yaw 弧度)、
+    size(lwh)、velocity/acceleration(转自车系：前向 vx、左向 vy)、is_static。
+    vel_state[id]=(vx_w, vy_w, t)；still_cnt[id] 为低速连续计数。"""
+    if aid is None:
+        return None
+    try:
+        actor = world.get_actor(aid)
+    except Exception:
+        actor = None
+    if actor is None:
+        return None
+    out = {"x": 0.0, "y": 0.0, "z": 0.0, "yaw": 0.0,
+           "length": 0.0, "width": 0.0, "height": 0.0,
+           "vx": 0.0, "vy": 0.0, "ax": 0.0, "ay": 0.0, "is_static": False}
+    tl = actor.get_transform()
+    out["x"], out["y"], out["z"] = tl.location.x, tl.location.y, tl.location.z
+    out["yaw"] = _math5.radians(tl.rotation.yaw)
+    ext = actor.bounding_box.extent
+    out["length"], out["width"], out["height"] = 2.0 * ext.x, 2.0 * ext.y, 2.0 * ext.z
+    v = actor.get_velocity()
+    yr = _math5.radians(ego.get_transform().rotation.yaw)
+    c, s = _math5.cos(yr), _math5.sin(yr)
+    out["vx"] = v.x * c + v.y * s      # 自车系前向
+    out["vy"] = -v.x * s + v.y * c     # 自车系左向
+    prev = vel_state.get(aid)
+    if prev is not None:
+        dt = max(1e-3, t - prev[2])
+        awx = (v.x - prev[0]) / dt
+        awy = (v.y - prev[1]) / dt
+        out["ax"] = awx * c + awy * s
+        out["ay"] = -awx * s + awy * c
+    vel_state[aid] = (v.x, v.y, t)
+    if v.x * v.x + v.y * v.y < 0.25:          # 速度模 < 0.5 m/s
+        still_cnt[aid] = still_cnt.get(aid, 0) + 1
+    else:
+        still_cnt[aid] = 0
+    out["is_static"] = still_cnt.get(aid, 0) >= 5
+    return out
+
 _EXP05_RUNNING = False
 _EXP05_ABORT = False
 _EXP05_THREAD = None
@@ -57,6 +100,8 @@ def _run_exp05(args):
 
     actors = []
     walker_pairs = []  # (walker_actor, controller_actor)，收尾先 stop 再 destroy
+    _exp5_vel_state = {}   # 障碍 id -> (vx_w, vy_w, t)，求加速度 / 判静态
+    _exp5_still_cnt = {}
     try:
         world.apply_settings(carla.WorldSettings(synchronous_mode=True, fixed_delta_seconds=fixed_delta))
         tm = client.get_trafficmanager(8000)
@@ -224,6 +269,7 @@ def _run_exp05(args):
             bev_payload = None
             grid_stat = None
             decision = None
+            rich = {}   # 障碍 id -> 真实 actor 补齐的 pose/size/运动学
             if ins.id in _instance_raw and sem.id in _semantic_raw:
                 try:
                     ih = int(ins.attributes["image_size_y"]); iw = int(ins.attributes["image_size_x"])
@@ -245,6 +291,13 @@ def _run_exp05(args):
                 except Exception as _exp5e:
                     _exp_log(f"感知融合异常: {_exp5e!r}")
 
+            # 障碍物 rich 信息：反查真实 actor 补齐 pose/size/速度/加速度/静态判定
+            for _tg in targets:
+                _d5 = _exp5_actor_metrics(world, vehicle, _tg.get("id"), t,
+                                          _exp5_vel_state, _exp5_still_cnt)
+                if _d5 is not None:
+                    rich[_tg.get("id")] = _d5
+
             ratios = {}
             if sem_labels is not None:
                 labeled = _label_semantic_level(sem_labels, level, instance, world)
@@ -261,9 +314,21 @@ def _run_exp05(args):
                 pt = {"frame": i + 1, "t": round(t, 3), "progress": round((i + 1) / total * 100, 1), "level": level}
                 pt.update({k + "_ratio": v for k, v in ratios.items()})
                 pt["targets"] = len(targets)
-                pt["obstacles"] = [{"id": t.get("id", k + 1), "cls": t["cls"],
-                                    "dist": round(t["dist"], 1)}
-                                   for k, t in enumerate(targets[:5])]
+                _obs5 = []
+                for _k, _tg in enumerate(targets[:5]):
+                    _ec = rich.get(_tg.get("id"), {})
+                    _obs5.append({
+                        "id": _tg.get("id", _k + 1), "cls": _tg["cls"],
+                        "dist": round(_tg["dist"], 1),
+                        "x": round(_ec.get("x", 0), 2), "y": round(_ec.get("y", 0), 2),
+                        "z": round(_ec.get("z", 0), 2), "yaw": round(_ec.get("yaw", 0), 3),
+                        "length": round(_ec.get("length", 0), 2), "width": round(_ec.get("width", 0), 2),
+                        "height": round(_ec.get("height", 0), 2),
+                        "vx": round(_ec.get("vx", 0), 2), "vy": round(_ec.get("vy", 0), 2),
+                        "ax": round(_ec.get("ax", 0), 2), "ay": round(_ec.get("ay", 0), 2),
+                        "is_static": bool(_ec.get("is_static", False)),
+                    })
+                pt["obstacles"] = _obs5
                 pt["grid_stat"] = grid_stat
                 pt["bev"] = bev_payload
                 if decision is not None:

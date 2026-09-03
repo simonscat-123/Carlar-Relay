@@ -418,13 +418,101 @@ def _draw_obstacle_list(screen, font, rect, obstacles, total):
                     (heads[2][1], ry))
 
 
+# 障碍物表格列定义：(表头, 取值 key, 宽, 格式)。value 为行 dict 取数。
+_OBST_COLS = [
+    ("ID", "id", 44, "raw"),
+    ("类型", "cls", 52, "cls"),
+    ("距离m", "dist", 56, "1f"),
+    ("x", "x", 56, "2f"), ("y", "y", 56, "2f"), ("z", "z", 56, "2f"),
+    ("yaw", "yaw", 58, "3f"),
+    ("长", "length", 50, "2f"), ("宽", "width", 50, "2f"), ("高", "height", 50, "2f"),
+    ("vx", "vx", 52, "2f"), ("vy", "vy", 52, "2f"),
+    ("ax", "ax", 52, "2f"), ("ay", "ay", 52, "2f"),
+    ("静态", "is_static", 56, "bool"),
+]
+
+
+def _fmt_obst(ob, key, fmt):
+    v = ob.get(key)
+    if fmt == "raw":
+        return "—" if v is None else str(v)
+    if fmt == "cls":
+        cls = str(v or "")
+        return _OBSTACLE_CLS.get(cls, cls or "目标"), cls
+    if fmt == "bool":
+        return "是" if v else "否", bool(v)
+    if fmt == "1f":
+        return "—" if v is None else f"{v:.1f}"
+    if fmt == "2f":
+        return "—" if v is None else f"{v:.2f}"
+    if fmt == "3f":
+        return "—" if v is None else f"{v:.3f}"
+    return "—"
+
+
+def _draw_obstacle_full_table(screen, fonts, rect, obstacles, total, status):
+    """整宽障碍物详细表格：pose(x,y,z,yaw) / size(l,w,h) / velocity(vx,vy) /
+    acceleration(ax,ay) / is_static，按距离近→远最多 5 行。"""
+    x, y, w, h = rect
+    pygame.draw.rect(screen, PANEL_BG, rect)
+    pygame.draw.rect(screen, PANEL_BORDER, rect, 1)
+    cols = _OBST_COLS
+
+    # 标题行 + 右上状态（识别总数 + 等级/决策/进度）
+    screen.blit(fonts["md"].render("障碍物详细 (pose · size · velocity · accel · static)", True, TEXT),
+                (x + 8, y + 4))
+    st = fonts["sm"].render(status, True, (255, 220, 120))
+    screen.blit(st, (x + w - st.get_width() - 8, y + 6))
+
+    # 分组表头
+    gy = y + 26
+    gsplit = {5: "Pose", 9: "Size", 11: "Velocity(自车系)", 13: "Accel(自车系)"}
+    g_labels = {}
+    col_x = []
+    cx = x + 8
+    for i, (lab, key, cw, fmt) in enumerate(cols):
+        col_x.append(cx)
+        if i in gsplit:
+            g_labels[cx] = gsplit[i]
+        cx += cw
+    # 画分组标签
+    for gcx, glab in g_labels.items():
+        t2 = fonts["sm"].render(glab, True, (150, 165, 195))
+        screen.blit(t2, (gcx, gy))
+    # 画每列表头
+    hy = gy + 18
+    for i, (lab, key, cw, fmt) in enumerate(cols):
+        screen.blit(fonts["sm"].render(lab, True, TEXT_DIM), (col_x[i], hy))
+
+    # 数据行（最多 5 行）
+    row_h = 20
+    r0 = hy + 22
+    for i, ob in enumerate(obstacles[:5]):
+        ry = r0 + i * row_h
+        if ry > y + h - 2:
+            break
+        for j, (lab, key, cw, fmt) in enumerate(cols):
+            tx = col_x[j]
+            if fmt == "cls":
+                name, clsk = _fmt_obst(ob, key, fmt)
+                col = (120, 200, 255) if clsk == "vehicle" else (250, 170, 60) if clsk == "walker" else TEXT
+                screen.blit(fonts["sm"].render(name, True, col), (tx, ry))
+            elif fmt == "bool":
+                txt, val = _fmt_obst(ob, key, fmt)
+                col = (255, 150, 100) if val else (140, 220, 150)
+                screen.blit(fonts["sm"].render(txt, True, col), (tx, ry))
+            else:
+                screen.blit(fonts["sm"].render(_fmt_obst(ob, key, fmt), True, TEXT), (tx, ry))
+
+
 def render_semantic(screen, fonts, surfaces, exp, hist: TelemetryHistory, ctx):
     w, h = screen.get_size()
     gap, mg = 8, 8
     pane_w = 456
-    top_y, top_h = 8, 404
+    top_y, top_h = 8, 300                 # 顶部三画面
+    tab_h = 188                           # 中部整宽障碍物表格
 
-    # 顶部三栏：前视 RGB 叠加检测框 | 语义着色 | BEV 鸟瞰栅格
+    # 顶部三栏：目标检测RGB(叠框) | 语义分割 | BEV 占用栅格
     for i, slot in enumerate(("camera", "semantic")):
         rect = (mg + i * (pane_w + gap), top_y, pane_w, top_h)
         surf = _slot_surf(surfaces, slot)
@@ -435,50 +523,43 @@ def render_semantic(screen, fonts, surfaces, exp, hist: TelemetryHistory, ctx):
     _draw_bev_panel(screen, (mg + 2 * (pane_w + gap), top_y, pane_w, top_h),
                     exp.get("trajectory") or {}, fonts["sm"])
 
-    # 底部三栏：语义占比 | BEV 栅格构成 | 障碍物列表 + 决策
-    chart_y = top_y + top_h + gap
-    chart_h = h - chart_y - mg
-    hist.exp5_ratio.draw(screen, fonts["sm"], (mg, chart_y, pane_w, chart_h))
-    hist.exp5_grid.draw(screen, fonts["sm"], (mg + (pane_w + gap), chart_y, pane_w, chart_h))
-
-    drect = (mg + 2 * (pane_w + gap), chart_y, pane_w, chart_h)
-
     traj = exp.get("trajectory") or {}
     res = exp.get("result") or {}
 
-    # 右下：障碍物识别列表（替换原目标数折线；右上角识别总数）
-    pygame.draw.rect(screen, PANEL_BG, drect)
-    pygame.draw.rect(screen, PANEL_BORDER, drect, 1)
-    screen.blit(fonts["md"].render("障碍物识别", True, TEXT), (drect[0] + 8, drect[1] + 6))
-    _draw_obstacle_list(screen, fonts["sm"],
-                        (drect[0] + 8, drect[1] + 30, drect[2] - 16, 128),
-                        traj.get("obstacles") or [], traj.get("targets", 0))
+    # 中部整宽：障碍物列表
+    ta_y = top_y + top_h + gap
+    _dst = (traj.get("decision") or None)
+    _table_status = f"识别总数 {traj.get('targets', 0)}" + (
+        (" · 决策 " + _dst.get("state", "—")) if _dst else " · 等待感知")
+    _draw_obstacle_full_table(screen, fonts, (mg, ta_y, w - 2 * mg, tab_h),
+                              traj.get("obstacles") or [], traj.get("targets", 0), _table_status)
 
-    # 决策 / 状态信息
-    row_top = drect[1] + 168
+    # 底部三栏：语义占比 | BEV 栅格构成 | 统计信息
+    by = ta_y + tab_h + gap
+    bh = h - 8 - by
+    hist.exp5_ratio.draw(screen, fonts["sm"], (mg, by, pane_w, bh))
+    hist.exp5_grid.draw(screen, fonts["sm"], (mg + (pane_w + gap), by, pane_w, bh))
+
+    srect = (mg + 2 * (pane_w + gap), by, pane_w, bh)
+    pygame.draw.rect(screen, PANEL_BG, srect)
+    pygame.draw.rect(screen, PANEL_BORDER, srect, 1)
+    screen.blit(fonts["md"].render("统计信息", True, TEXT), (srect[0] + 8, srect[1] + 6))
     level = traj.get("level") or ctx.get("params", {}).get("level", "—")
-    if traj.get("decision"):
-        d = traj["decision"]
-        lines = [
-            f"决策 {d.get('state', '—')} · {d.get('label', '')}",
-            f"原因 {d.get('reason', '—')}",
-            f"目标横向 {d.get('target_lat', 0):+.1f}m · 占用 {d.get('block_m', '—')}m",
-        ]
-        lines.insert(0, f"自动驾驶等级 {level}")
+    lines = [f"自动驾驶等级 {level}"]
+    d = traj.get("decision")
+    if d:
+        lines += [f"决策 {d.get('state', '—')} · {d.get('label', '')}",
+                  f"原因 {d.get('reason', '—')}",
+                  f"目标横向 {d.get('target_lat', 0):+.1f}m · 占用 {d.get('block_m', '—')}m"]
     else:
-        lines = [f"自动驾驶等级 {level}", "等待感知…"]
+        lines += ["等待感知…"]
     lines.append(f"进度 {traj.get('progress', 0):.0f}% · t {traj.get('t', 0):.0f}s")
-    ratios = [(k[:-len("_ratio")], v) for k, v in traj.items()
-              if k.endswith("_ratio") and isinstance(v, (int, float))]
-    ratios.sort(key=lambda kv: -kv[1])
-    if ratios:
-        lines.append("占比 " + " · ".join(f"{k} {v * 100:.0f}%" for k, v in ratios[:3]))
     if res:
         lines.insert(0, f"完成 · 采样 {res.get('rows', '—')} 行 · 用时 {res.get('elapsed', '—')}s")
     done = "实验结束（ESC 退出）" if exp.get("status") in ("done", "stopped") else (
         "出错：" + str(exp.get("message", "")) if exp.get("status") == "error" else None)
-    _hud_lines(screen, fonts["sm"], (drect[0] + 8, row_top,
-                                     drect[2] - 16, drect[1] + drect[3] - 8 - row_top),
+    _hud_lines(screen, fonts["sm"], (srect[0] + 8, srect[1] + 30,
+                                     srect[2] - 16, srect[3] - 34),
                lines, done)
 
 
