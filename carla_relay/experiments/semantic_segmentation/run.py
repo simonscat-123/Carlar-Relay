@@ -37,8 +37,11 @@ def _run_exp05(args):
     _semantic_level = level
     # 感知融合 → BEV 构建参数（task 参数可覆盖）
     perc_range = float(args.get("perception_range", 50.0))
+    sem_range = float(args.get("semantic_range", 40.0))
     bev_span = float(args.get("bev_span", 60.0))
     bev_res = float(args.get("bev_res", 0.5))
+    npc_count = int(args.get("npc_count", 0))
+    walker_count = int(args.get("walker_count", 6))
 
     cam_fov = 90.0   # 语义/实例相机 FOV（度）
     cam_pitch = -5.0  # 相机安装俯仰（负值向下，供地面逆投影 / 单目测距）
@@ -49,14 +52,26 @@ def _run_exp05(args):
     # 感知融合 / BEV 世界 / 基于栅格的规划器（每 tick 复用）
     bev = _exp5_BevBuilder(span=bev_span, res=bev_res, cam_fov=cam_fov,
                            cam_pitch=cam_pitch, cam_height=cam_height,
-                           perc_range=perc_range, subsample=2)
+                           perc_range=perc_range, sem_range=sem_range, subsample=2)
     planner = _exp5_GridPlanner()
 
     actors = []
+    walker_pairs = []  # (walker_actor, controller_actor)，收尾先 stop 再 destroy
     try:
         world.apply_settings(carla.WorldSettings(synchronous_mode=True, fixed_delta_seconds=fixed_delta))
         tm = client.get_trafficmanager(8000)
         tm.set_synchronous_mode(True)
+        # TM 全局调参：车距 / 车速差 / 混合物理（官方 generate_traffic 口径）
+        tm.set_global_distance_to_leading_vehicle(2.5)
+        try:
+            tm.global_percentage_speed_difference(25.0)
+        except Exception:
+            pass
+        try:
+            tm.set_hybrid_physics_mode(True)
+            tm.set_hybrid_physics_radius(70.0)
+        except Exception:
+            pass
 
         bp = world.get_blueprint_library().filter("vehicle.*")[0]
         rng = random.Random(seed)
@@ -98,6 +113,77 @@ def _run_exp05(args):
             with _lock:
                 _managed_actors.add(a.id)
         _exp_log(f"车辆+RGB+语义+实例相机已挂载 (id={v_id})")
+
+        # ── 生成 NPC 交通车（官方生成 traffic 的方式：batch 生成 + TM 接管）──
+        from carla.command import SpawnActor as _cSpawn, SetAutopilot as _cAuto, \
+            FutureActor as _cFuture, DestroyActor as _cDestroy
+        npc_list = []
+        if npc_count > 0:
+            car_bps = sorted(world.get_blueprint_library().filter("vehicle.*"),
+                         key=lambda b: b.id)
+            if car_bps:
+                sp = world.get_map().get_spawn_points()
+                avail = [s for s in sp if s.location.distance(vehicle.get_location()) >= 5.0]
+                n = min(npc_count, len(avail))
+                if n > 0:
+                    nrng = random.Random(seed + 100)
+                    batch = []
+                    for rec in nrng.sample(avail, n):
+                        bp = nrng.choice(car_bps)
+                        batch.append(_cSpawn(bp, rec).then(_cAuto(_cFuture, True, tm.get_port())))
+                    for r in client.apply_batch_sync(batch, True):
+                        if not r.error:
+                            a = world.get_actor(r.actor_id)
+                            if a is not None:
+                                actors.append(a)
+                                npc_list.append(a)
+                    if npc_list:
+                        _exp_log(f"已生成 {len(npc_list)}/{npc_count} 辆 NPC 交通车")
+
+        # ── 生成行人（官方 flow：walker 实体 + controller.ai.walker）──
+        if walker_count > 0:
+            wbps = list(world.get_blueprint_library().filter("walker.pedestrian.*"))
+            if wbps:
+                try:
+                    world.set_pedestrians_seed(seed + 300)
+                except Exception:
+                    pass
+                wrng = random.Random(seed + 400)
+                wlocs, wspeeds = [], []
+                for _ in range(walker_count):
+                    loc = world.get_random_location_from_navigation()
+                    if loc is None:
+                        continue
+                    loc.z += 0.3
+                    bp = wrng.choice(wbps)
+                    wlocs.append(loc)
+                    sp = 1.4
+                    if bp.has_attribute("speed"):
+                        sv = bp.get_attribute("speed").recommended_values
+                        if len(sv) > 1 and sv[1]:
+                            sp = float(sv[1])
+                    wspeeds.append(sp)
+                wids = [r.actor_id for r in client.apply_batch_sync(
+    [_cSpawn(wrng.choice(wbps), carla.Transform(loc)) for loc in wlocs], True) if not r.error]
+                cids = [r.actor_id for r in client.apply_batch_sync(
+                    [_cSpawn(world.get_blueprint_library().find("controller.ai.walker"),
+                             carla.Transform(), wid) for wid in wids], True) if not r.error]
+                world.tick()
+                for i in range(min(len(wids), len(cids))):
+                    wa = world.get_actor(wids[i])
+                    ca = world.get_actor(cids[i])
+                    if wa is not None and ca is not None:
+                        try:
+                            ca.start()
+                            ca.go_to_location(world.get_random_location_from_navigation())
+                            ca.set_max_speed(wspeeds[i] if i < len(wspeeds) else 1.4)
+                        except Exception:
+                            pass
+                        actors.append(wa)
+                        actors.append(ca)
+                        walker_pairs.append((wa, ca))
+                if walker_pairs:
+                    _exp_log(f"已生成 {len(walker_pairs)}/{walker_count} 个行人")
 
         _exp_log("渲染预热中（首帧着色器编译）…")
         settle_ticks = int(1.0 / fixed_delta)
@@ -175,6 +261,9 @@ def _run_exp05(args):
                 pt = {"frame": i + 1, "t": round(t, 3), "progress": round((i + 1) / total * 100, 1), "level": level}
                 pt.update({k + "_ratio": v for k, v in ratios.items()})
                 pt["targets"] = len(targets)
+                pt["obstacles"] = [{"id": t.get("id", k + 1), "cls": t["cls"],
+                                    "dist": round(t["dist"], 1)}
+                                   for k, t in enumerate(targets[:5])]
                 pt["grid_stat"] = grid_stat
                 pt["bev"] = bev_payload
                 if decision is not None:
@@ -220,6 +309,14 @@ def _run_exp05(args):
             try:
                 if _a is not None and getattr(_a, "type_id", "").startswith("vehicle."):
                     _a.set_autopilot(False)
+            except Exception:
+                pass
+
+        # 行人 controller 先 stop，再统一销毁（避免持控 walker 时销毁崩溃）
+        for _w, _c in walker_pairs:
+            try:
+                if _c is not None and _c.is_alive:
+                    _c.stop()
             except Exception:
                 pass
 

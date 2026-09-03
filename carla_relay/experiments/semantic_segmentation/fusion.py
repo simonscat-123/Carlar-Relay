@@ -69,6 +69,7 @@ def perceive(inst_arr, sem_arr, *, cam_fov=90.0, cam_pitch=-5.0,
         psi = math.atan2(u0 - u_c, fx)                     # 水平方位角（左正右负）
         cls = "walker" if n_wal > n_veh else "vehicle"
         targets.append({
+            "id": iid,
             "cls": cls,
             "dist": dist,
             "fwd": dist * math.cos(psi),

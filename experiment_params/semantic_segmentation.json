@@ -8,7 +8,10 @@
     "duration": 40,
     "level": "L2",
     "perception_range": 50,
+    "semantic_range": 40,
     "bev_span": 60,
-    "bev_res": 0.5
+    "bev_res": 0.5,
+    "npc_count": 20,
+    "walker_count": 6
   }
 }

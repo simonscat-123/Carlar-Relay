@@ -387,6 +387,37 @@ def _draw_bev_panel(screen, rect, traj, font):
         screen.blit(lbl, (rect[0] + rect[2] - lbl.get_width() - 8, rect[1] + 5))
 
 
+_OBSTACLE_CLS = {"vehicle": "车辆", "walker": "行人", "rider": "骑手"}
+
+
+def _draw_obstacle_list(screen, font, rect, obstacles, total):
+    """障碍物列表表格：ID / 类型 / 距离(m)，按距离优先（近→远）最多 5 项，
+    右上角显示识别总数。替代原「检测目标数」折线图。"""
+    x, y, w, h = rect
+    # 右上角：识别总数
+    total_txt = f"识别总数 {total}"
+    ts = font.render(total_txt, True, (255, 220, 120))
+    screen.blit(ts, (x + w - ts.get_width(), y))
+    # 表头
+    heads = [("ID", x), ("类型", x + 84), ("距离(m)", x + 170)]
+    hy = y + 16
+    for label, hx in heads:
+        screen.blit(font.render(label, True, TEXT_DIM), (hx, hy))
+    # 数据行（最多 5 项）
+    row_h = 20
+    for i, ob in enumerate(obstacles[:5]):
+        ry = hy + 22 + i * row_h
+        if ry > y + h - 4:
+            break
+        cls = ob.get("cls", "")
+        col = (120, 200, 255) if cls == "vehicle" else (250, 170, 60) if cls == "walker" else TEXT
+        screen.blit(font.render(str(ob.get("id", "—")), True, TEXT), (heads[0][1], ry))
+        name = _OBSTACLE_CLS.get(cls, cls or "目标")
+        screen.blit(font.render(name, True, col), (heads[1][1], ry))
+        screen.blit(font.render(f"{ob.get('dist', 0):.1f}", True, TEXT),
+                    (heads[2][1], ry))
+
+
 def render_semantic(screen, fonts, surfaces, exp, hist: TelemetryHistory, ctx):
     w, h = screen.get_size()
     gap, mg = 8, 8
@@ -404,20 +435,27 @@ def render_semantic(screen, fonts, surfaces, exp, hist: TelemetryHistory, ctx):
     _draw_bev_panel(screen, (mg + 2 * (pane_w + gap), top_y, pane_w, top_h),
                     exp.get("trajectory") or {}, fonts["sm"])
 
-    # 底部三栏：语义占比 | BEV 栅格构成 | 决策 + 目标数
+    # 底部三栏：语义占比 | BEV 栅格构成 | 障碍物列表 + 决策
     chart_y = top_y + top_h + gap
     chart_h = h - chart_y - mg
     hist.exp5_ratio.draw(screen, fonts["sm"], (mg, chart_y, pane_w, chart_h))
     hist.exp5_grid.draw(screen, fonts["sm"], (mg + (pane_w + gap), chart_y, pane_w, chart_h))
 
     drect = (mg + 2 * (pane_w + gap), chart_y, pane_w, chart_h)
-    pygame.draw.rect(screen, PANEL_BG, drect)
-    pygame.draw.rect(screen, PANEL_BORDER, drect, 1)
-    screen.blit(fonts["md"].render("规划决策", True, TEXT), (drect[0] + 8, drect[1] + 6))
-    hist.exp5_targets.draw(screen, fonts["sm"], (drect[0] + 8, drect[1] + 34, drect[2] - 16, 110))
 
     traj = exp.get("trajectory") or {}
     res = exp.get("result") or {}
+
+    # 右下：障碍物识别列表（替换原目标数折线；右上角识别总数）
+    pygame.draw.rect(screen, PANEL_BG, drect)
+    pygame.draw.rect(screen, PANEL_BORDER, drect, 1)
+    screen.blit(fonts["md"].render("障碍物识别", True, TEXT), (drect[0] + 8, drect[1] + 6))
+    _draw_obstacle_list(screen, fonts["sm"],
+                        (drect[0] + 8, drect[1] + 30, drect[2] - 16, 128),
+                        traj.get("obstacles") or [], traj.get("targets", 0))
+
+    # 决策 / 状态信息
+    row_top = drect[1] + 168
     level = traj.get("level") or ctx.get("params", {}).get("level", "—")
     if traj.get("decision"):
         d = traj["decision"]
@@ -426,9 +464,9 @@ def render_semantic(screen, fonts, surfaces, exp, hist: TelemetryHistory, ctx):
             f"原因 {d.get('reason', '—')}",
             f"目标横向 {d.get('target_lat', 0):+.1f}m · 占用 {d.get('block_m', '—')}m",
         ]
+        lines.insert(0, f"自动驾驶等级 {level}")
     else:
-        lines = ["等待感知…"]
-    lines.insert(0, f"自动驾驶等级 {level} · 目标 {traj.get('targets', 0)}")
+        lines = [f"自动驾驶等级 {level}", "等待感知…"]
     lines.append(f"进度 {traj.get('progress', 0):.0f}% · t {traj.get('t', 0):.0f}s")
     ratios = [(k[:-len("_ratio")], v) for k, v in traj.items()
               if k.endswith("_ratio") and isinstance(v, (int, float))]
@@ -439,8 +477,9 @@ def render_semantic(screen, fonts, surfaces, exp, hist: TelemetryHistory, ctx):
         lines.insert(0, f"完成 · 采样 {res.get('rows', '—')} 行 · 用时 {res.get('elapsed', '—')}s")
     done = "实验结束（ESC 退出）" if exp.get("status") in ("done", "stopped") else (
         "出错：" + str(exp.get("message", "")) if exp.get("status") == "error" else None)
-    _hud_lines(screen, fonts["sm"], (drect[0] + 8, drect[1] + 150,
-                                     drect[2] - 16, drect[3] - 150), lines, done)
+    _hud_lines(screen, fonts["sm"], (drect[0] + 8, row_top,
+                                     drect[2] - 16, drect[1] + drect[3] - 8 - row_top),
+               lines, done)
 
 
 # ═══════════════════════════════════════════════════════════════════

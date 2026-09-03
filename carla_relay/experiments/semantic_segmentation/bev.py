@@ -54,7 +54,7 @@ class BevBuilder:
     """以自车为中心的前向占据栅格构建器。"""
 
     def __init__(self, *, span=60.0, res=0.5, cam_fov=90.0, cam_pitch=-5.0,
-                 cam_height=1.7, perc_range=50.0, subsample=2):
+                 cam_height=1.7, perc_range=50.0, sem_range=40.0, subsample=2):
         self.res = res
         self.span = span
         self.G = int(round(span / res))
@@ -63,6 +63,7 @@ class BevBuilder:
         self.cam_pitch = cam_pitch
         self.cam_height = cam_height
         self.perc_range = perc_range
+        self.sem_range = sem_range                    # 语义像素融合距离上限（m）
         self.subsample = int(max(1, subsample))
         self.tilt_rad = math.radians(-cam_pitch)
         self.fx = None        # 首次 build 时按语义图尺寸缓存
@@ -88,20 +89,24 @@ class BevBuilder:
             self._sem_w = int(sem_w or sem_labels.shape[1])
             self._ensure_intrinsics(self._sem_w)
             ssub = self.subsample
+            # 语义投影统一按 sem_range 截断（前向距离内才融合进栅格）
+            sem_m = self.sem_range
             # 可行驶投影（道路/车道线）
             ys, xs = np.nonzero(np.isin(sem_labels, DRIVABLE_LABELS))
             if ys.size:
                 fwd, lat = _project_pixels(
                     ys[::ssub], xs[::ssub], self.fx, self.u0, self.v0,
                     self.tilt_rad, self.cam_height)
-                self._paint(cells, fwd, lat, FREE)
+                keep = fwd <= sem_m
+                self._paint(cells, fwd[keep], lat[keep], FREE)
             # 静态障碍投影（建筑/墙/护栏…）
             ys, xs = np.nonzero(np.isin(sem_labels, STATIC_BARRIER_LABELS))
             if ys.size:
                 fwd, lat = _project_pixels(
                     ys[::ssub], xs[::ssub], self.fx, self.u0, self.v0,
                     self.tilt_rad, self.cam_height)
-                self._paint(cells, fwd, lat, STATIC)
+                keep = fwd <= sem_m
+                self._paint(cells, fwd[keep], lat[keep], STATIC)
 
         # 动态障碍：按目标估计足迹覆盖栅格（覆盖同位置的纯可行驶标记）
         for t in targets:
