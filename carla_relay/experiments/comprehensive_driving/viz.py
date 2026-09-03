@@ -110,7 +110,7 @@ def render_perceived_frame(rgb_arr, perceived, inst_w, inst_h):
         xmin, ymin, xmax, ymax = xmin * sx, ymin * sy, xmax * sx, ymax * sy
         name, color = EXP10_PERC_STYLE.get(p["cls"], ("目标", (85, 170, 255)))
         draw.rectangle([xmin, ymin, xmax, ymax], outline=color, width=2)
-        label = f"{name} {p['dist']:.1f}m·视觉"
+        label = f"{name}"
         tw = draw.textlength(label, font=font)
         ty = ymin - th - 6
         if ty < 0:

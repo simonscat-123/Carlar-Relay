@@ -8,7 +8,8 @@
 
 # 感知融合 → BEV 占据栅格世界 → 基于栅格的规划（真实模块，绝对路径导入）
 from carla_relay.experiments.semantic_segmentation.fusion import perceive as _exp5_perceive
-from carla_relay.experiments.semantic_segmentation.bev import BevBuilder as _exp5_BevBuilder
+from carla_relay.experiments.semantic_segmentation.bev import (
+    BevBuilder as _exp5_BevBuilder, _project_pixels as _exp5_project)
 from carla_relay.experiments.semantic_segmentation.grid_planner import GridPlanner as _exp5_GridPlanner
 from carla_relay.experiments.comprehensive_driving.viz import render_perceived_frame as _exp5_render_perceived
 
@@ -94,9 +95,15 @@ def _exp5_actor_metrics(world, ego, aid, t, vel_state, still_cnt):
         return None
     try:
         actor = world.get_actor(aid)
-    except Exception:
-        actor = None
+    except Exception as exc:
+        if aid not in _EXP05_MISSED:
+            _EXP05_MISSED.add(aid)
+            _exp_log(f"[metrics] get_actor 异常 aid={aid}: {exc!r}")
+        return None
     if actor is None:
+        if aid not in _EXP05_MISSED:
+            _EXP05_MISSED.add(aid)
+            _exp_log(f"[metrics] get_actor 返回 None aid={aid}")
         return None
     out = {"x": 0.0, "y": 0.0, "z": 0.0, "yaw": 0.0,
            "length": 0.0, "width": 0.0, "height": 0.0,
@@ -107,10 +114,14 @@ def _exp5_actor_metrics(world, ego, aid, t, vel_state, still_cnt):
     ext = actor.bounding_box.extent
     out["length"], out["width"], out["height"] = 2.0 * ext.x, 2.0 * ext.y, 2.0 * ext.z
     v = actor.get_velocity()
+    if aid not in _EXP05_VLOG:
+        _EXP05_VLOG.add(aid)
+        _exp_log(f"[metrics] aid={aid} type={actor.type_id} "
+                 f"vel=({v.x:.2f},{v.y:.2f}) acti={actor.is_alive}")
     yr = _math5.radians(ego.get_transform().rotation.yaw)
     c, s = _math5.cos(yr), _math5.sin(yr)
     out["vx"] = v.x * c + v.y * s      # 自车系前向
-    out["vy"] = -v.x * s + v.y * c     # 自车系左向
+    out["vy"] = -v.x * s + v.y * c     # 自车系右向
     prev = vel_state.get(aid)
     if prev is not None:
         dt = max(1e-3, t - prev[2])
@@ -126,7 +137,67 @@ def _exp5_actor_metrics(world, ego, aid, t, vel_state, still_cnt):
     out["is_static"] = still_cnt.get(aid, 0) >= 5
     return out
 
+
+def _exp5_ego_project(ego, fwd, lat):
+    """车体系 (fwd 前向, lat 右正) → 全局 (x, y)。右向量 = (sin, -cos)（与综合驾驶一致）。"""
+    etf = ego.get_transform()
+    yr = _math5.radians(etf.rotation.yaw)
+    c, s = _math5.cos(yr), _math5.sin(yr)
+    gx = etf.location.x + fwd * c + lat * s
+    gy = etf.location.y + fwd * s - lat * c
+    return gx, gy
+
+
+def _exp5_static_by_pos(ego, tg, t, pos_hist):
+    """跨帧全局位移判定静态：位移速率 < 0.5 m/s 累计 5 帧 → True。
+    不依赖 actor 真值速度，actor 反查失败时仍能正确判定静止。"""
+    gx, gy = _exp5_ego_project(ego, tg.get("fwd", 0.0), tg.get("lat", 0.0))
+    aid = tg.get("id")
+    prev = pos_hist.get(aid)
+    if prev is not None:
+        px, py, pt, pc = prev
+        dt = max(1e-3, t - pt)
+        sp = _math5.hypot(gx - px, gy - py) / dt
+        cnt = pc + 1 if sp < 0.5 else 0
+    else:
+        cnt = 0
+    pos_hist[aid] = (gx, gy, t, cnt)
+    return cnt >= 5
+
+
+def _exp5_fallback_size(ego, tg):
+    """actor 反查失败时，用感知估计补尺寸（长度=2×典型半长，宽度=单目宽度，高度=类别典型）。
+    位置由车体系投影到全局；vx/vy/ax/ay 无真值置 None（表格显示 —）。"""
+    cls = tg["cls"]
+    x, y = _exp5_ego_project(ego, tg.get("fwd", 0.0), tg.get("lat", 0.0))
+    return {"x": round(x, 2), "y": round(y, 2), "z": 0.0, "yaw": None,
+            "length": round(2.0 * tg.get("half_len", 1.5), 2),
+            "width": round(tg.get("width_m", 0.8), 2),
+            "height": round(1.8 if cls == "walker" else 1.5, 2),
+            "vx": None, "vy": None, "ax": None, "ay": None,
+            "is_static": False}
+
+
+def _exp5_depth_gray_jpeg(raw, h, w, max_range):
+    """深度 raw BGRA → 对数灰度 JPEG，> max_range(米) 置黑（depth_range 截断视图）。"""
+    arr = np.frombuffer(raw, dtype=np.uint8).reshape((h, w, 4))
+    r = arr[:, :, 2].astype(np.float32)
+    g = arr[:, :, 1].astype(np.float32)
+    b = arr[:, :, 0].astype(np.float32)
+    d = np.clip((r + g * 256.0 + b * 256.0 * 256.0) / (2.0 ** 24 - 1.0) * 1000.0,
+                0.1, max_range)
+    log_range = np.log1p(max_range) - np.log1p(0.1)
+    gray = np.clip(255.0 * (1.0 - (np.log1p(d) - np.log1p(0.1)) / log_range),
+                   0, 255).astype(np.uint8)
+    img = PIL.Image.fromarray(np.stack([gray, gray, gray], axis=-1))
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=80)
+    return buf.getvalue()
+
+
 _EXP05_RUNNING = False
+_EXP05_MISSED = set()  # 已诊断过的反查失败 actor id（避免每帧刷屏）
+_EXP05_VLOG = set()    # 已打印过原始速度的 actor id
 _EXP05_ABORT = False
 _EXP05_THREAD = None
 _EXP05_LOCK = threading.Lock()
@@ -152,6 +223,7 @@ def _run_exp05(args):
     # 感知融合 → BEV 构建参数（task 参数可覆盖）
     perc_range = float(args.get("perception_range", 50.0))
     sem_range = float(args.get("semantic_range", 40.0))
+    depth_range = float(args.get("depth_range", 80.0))
     bev_span = float(args.get("bev_span", 60.0))
     bev_res = float(args.get("bev_res", 0.5))
     npc_count = int(args.get("npc_count", 0))
@@ -162,6 +234,7 @@ def _run_exp05(args):
     cam_height = 1.7  # 相机离地高度（m）
 
     _exp5_rgb_raw = {}  # 前相机原始 BGRA（供检测框叠加）
+    _exp5_depth_raw = {}  # 深度相机原始 BGRA（供 depth_range 截断渲染）
 
     # 感知融合 / BEV 世界 / 基于栅格的规划器（每 tick 复用）
     bev = _exp5_BevBuilder(span=bev_span, res=bev_res, cam_fov=cam_fov,
@@ -173,6 +246,7 @@ def _run_exp05(args):
     walker_pairs = []  # (walker_actor, controller_actor)，收尾先 stop 再 destroy
     _exp5_vel_state = {}   # 障碍 id -> (vx_w, vy_w, t)，求加速度 / 判静态
     _exp5_still_cnt = {}
+    _exp5_pos_hist = {}    # 障碍 id -> (gx, gy, t, cnt)，跨帧全局位移判静态
     try:
         world.apply_settings(carla.WorldSettings(synchronous_mode=True, fixed_delta_seconds=fixed_delta))
         tm = client.get_trafficmanager(8000)
@@ -183,9 +257,10 @@ def _run_exp05(args):
             tm.global_percentage_speed_difference(25.0)
         except Exception:
             pass
+        # 关闭 hybrid physics：该模式下 NPC 无真实物理，get_velocity() 恒为 0，
+        # 会让障碍物表格速度/加速度/静态判定全部失真。改为完整物理模拟。
         try:
-            tm.set_hybrid_physics_mode(True)
-            tm.set_hybrid_physics_radius(70.0)
+            tm.set_hybrid_physics_mode(False)
         except Exception:
             pass
 
@@ -233,7 +308,8 @@ def _run_exp05(args):
         dep = world.spawn_actor(dep_bp, carla.Transform(carla.Location(x=1.5, z=cam_height), carla.Rotation(pitch=cam_pitch)), attach_to=vehicle)
         actors.append(dep)
         _sensor_refs[dep.id] = dep
-        dep.listen(lambda d, sid=dep.id: _sensor_callback(sid, "depth", d))
+        dep.listen(lambda d, sid=dep.id: _sensor_callback(sid, "depth", d)
+                   or _exp5_depth_raw.__setitem__(sid, bytes(d.raw_data)))
 
         for a in actors:
             with _lock:
@@ -360,7 +436,9 @@ def _run_exp05(args):
                     targets = _exp5_perceive(inst_arr, sem_arr, cam_fov=cam_fov,
                                              cam_pitch=cam_pitch, cam_height=cam_height,
                                              perc_range=perc_range, exclude_ids=(vehicle.id,))
-                    cells, grid_stat, bev_payload = bev.build(sem_labels, targets,
+                    # BEV 动态障碍足迹：目标识别距离 + 深度距离双重约束
+                    _tg_range = [t for t in targets if t["dist"] <= depth_range]
+                    cells, grid_stat, bev_payload = bev.build(sem_labels, _tg_range,
                                                               sem_h=sh, sem_w=sw)
                     decision = planner.decide(cells, res=bev.res)
                     # 前视 RGB 叠加检测框（复用综合驾驶 viz 渲染；失败不影响主流程）
@@ -376,14 +454,34 @@ def _run_exp05(args):
             for _tg in targets:
                 _d5 = _exp5_actor_metrics(world, vehicle, _tg.get("id"), t,
                                           _exp5_vel_state, _exp5_still_cnt)
-                if _d5 is not None:
-                    rich[_tg.get("id")] = _d5
+                if _d5 is None:
+                    # actor 反查失败：尺寸回退感知估计（不再显示 0）
+                    _d5 = _exp5_fallback_size(vehicle, _tg)
+                # 静态判定统一用跨帧位移（不依赖可能失败的 actor 真值）
+                _d5["is_static"] = _exp5_static_by_pos(vehicle, _tg, t, _exp5_pos_hist)
+                rich[_tg.get("id")] = _d5
+
+            # 深度相机画面：按 depth_range 对数灰度 + 截断（超距置黑）
+            if dep.id in _exp5_depth_raw:
+                try:
+                    _sensor_frames[dep.id] = _exp5_depth_gray_jpeg(
+                        _exp5_depth_raw[dep.id], 600, 800, depth_range)
+                    _sensor_frame_num[dep.id] = _sensor_frame_num.get(dep.id, 0) + 1
+                except Exception:
+                    pass
 
             ratios = {}
             if sem_labels is not None:
                 labeled = _label_semantic_classes(sem_labels, classes, instance, world)
                 ratios = _ratios_from_labels(labeled, classes)
                 rgb = _colors_from_labels(labeled, classes)
+                # 语义画面：超出 semantic_range 的区域置黑（语义感知距离外不显示）
+                sh, sw = sem_labels.shape
+                fx5 = (sw / 2.0) / _math5.tan(_math5.radians(cam_fov) / 2.0)
+                ys5, xs5 = np.indices((sh, sw)).reshape(2, -1)
+                fwd5 = _exp5_project(ys5, xs5, fx5, sw / 2.0, sh / 2.0,
+                                     _math5.radians(-cam_pitch), cam_height)[0].reshape(sh, sw)
+                rgb = np.where((fwd5 <= sem_range)[..., None], rgb, 0)
                 img = PIL.Image.fromarray(rgb, mode="RGB")
                 buf = io.BytesIO()
                 img.save(buf, format="JPEG", quality=85)
@@ -398,22 +496,30 @@ def _run_exp05(args):
                 _obs5 = []
                 for _k, _tg in enumerate(targets[:5]):
                     _ec = rich.get(_tg.get("id"), {})
+                    # 深度测距是否有效：超过 depth_range 则依赖深度的字段置空；值缺失时亦置空
+                    _ok5 = _tg["dist"] <= depth_range
+                    def _v5(k, n):
+                        v = _ec.get(k)
+                        return round(v, n) if (_ok5 and v is not None) else None
                     _obs5.append({
                         "id": _tg.get("id", _k + 1), "cls": _tg["cls"],
-                        "dist": round(_tg["dist"], 1),
-                        "x": round(_ec.get("x", 0), 2), "y": round(_ec.get("y", 0), 2),
-                        "z": round(_ec.get("z", 0), 2), "yaw": round(_ec.get("yaw", 0), 3),
-                        "length": round(_ec.get("length", 0), 2), "width": round(_ec.get("width", 0), 2),
-                        "height": round(_ec.get("height", 0), 2),
-                        "vx": round(_ec.get("vx", 0), 2), "vy": round(_ec.get("vy", 0), 2),
-                        "ax": round(_ec.get("ax", 0), 2), "ay": round(_ec.get("ay", 0), 2),
-                        "is_static": bool(_ec.get("is_static", False)),
+                        "dist": round(_tg["dist"], 1) if _ok5 else None,
+                        "x": _v5("x", 2), "y": _v5("y", 2), "z": _v5("z", 2),
+                        "yaw": _v5("yaw", 3),
+                        "length": _v5("length", 2), "width": _v5("width", 2),
+                        "height": _v5("height", 2),
+                        "vx": _v5("vx", 2), "vy": _v5("vy", 2),
+                        "ax": _v5("ax", 2), "ay": _v5("ay", 2),
+                        "is_static": (bool(_ec.get("is_static", False))
+                                      if _ok5 and _ec.get("is_static") is not None
+                                      else None),
                     })
                 pt["obstacles"] = _obs5
                 pt["grid_stat"] = grid_stat
                 pt["bev"] = bev_payload
                 try:
-                    pt["lane_edges"] = _exp5_lane_geoms(world, vehicle.get_transform())
+                    pt["lane_edges"] = _exp5_lane_geoms(world, vehicle.get_transform(),
+                                                        front=sem_range)
                 except Exception:
                     pass
                 if decision is not None:

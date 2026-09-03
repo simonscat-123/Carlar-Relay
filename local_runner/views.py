@@ -465,7 +465,9 @@ def _fmt_obst(ob, key, fmt):
         cls = str(v or "")
         return _OBSTACLE_CLS.get(cls, cls or "目标"), cls
     if fmt == "bool":
-        return "是" if v else "否", bool(v)
+        if v is None:
+            return "—", None
+        return ("是" if v else "否"), bool(v)
     if fmt == "1f":
         return "—" if v is None else f"{v:.1f}"
     if fmt == "2f":
@@ -527,7 +529,7 @@ def _draw_obstacle_full_table(screen, fonts, rect, obstacles, total, status):
                 screen.blit(fonts["sm"].render(name, True, col), (tx, ry))
             elif fmt == "bool":
                 txt, val = _fmt_obst(ob, key, fmt)
-                col = (255, 150, 100) if val else (140, 220, 150)
+                col = (140, 220, 150) if val is True else (255, 150, 100) if val is False else TEXT_DIM
                 screen.blit(fonts["sm"].render(txt, True, col), (tx, ry))
             else:
                 screen.blit(fonts["sm"].render(_fmt_obst(ob, key, fmt), True, TEXT), (tx, ry))

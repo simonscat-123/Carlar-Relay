@@ -350,6 +350,8 @@ def _sensor_callback(sid: int, dtype: str, data: Any):
             _semantic_raw[sid] = payload
         elif dtype == "instance":
             _instance_raw[sid] = payload  # 原始 BGRA，22 类动态细分在主循环解码
+        elif dtype == "depth":
+            pass  # 深度帧由实验主循环独占渲染（支持距离截断），core 不写原始帧
         else:
             _sensor_frames[sid] = payload
             if fnum is not None:
