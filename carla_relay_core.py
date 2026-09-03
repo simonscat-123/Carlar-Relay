@@ -161,7 +161,7 @@ _sensor_frames: Dict[int, bytes] = {}  # sid → 最新帧数据（JPEG 字节�
 _sensor_frame_num: Dict[int, int] = {}  # sid → CARLA 帧号（用于调试）
 _sensor_dtype: Dict[int, str] = {}  # sensor_id -> "camera" | "lidar" | "gnss" | "imu" | "semantic" | "instance"
 _semantic_raw: Dict[int, bytes] = {}  # semantic sensor_id -> 原始 BGRA raw（用于统计占比）
-_instance_raw: Dict[int, bytes] = {}  # instance sensor_id -> 原始 BGRA raw（用于 L3 动态细分）
+_instance_raw: Dict[int, bytes] = {}  # instance sensor_id -> 原始 BGRA raw（用于 22 类动态细分）
 
 # 旧版同步设置（用于恢复）
 _old_settings: Any = None
@@ -169,8 +169,8 @@ _old_settings: Any = None
 # SSE 订阅者队列已抽取至 carla_relay.core.sse（P2）：订阅者管理与广播由 hub 承载
 # =============================================================================
 # 以下配置/感知/核心逻辑已抽取至 server/carla_relay 包（P1-P2 绞杀者迁移）：
-#   - carla_relay.config: 语义类别表 / L2L3 映射 / 帧间隔常量
-#   - carla_relay.perception.semantics: 语义等级映射纯函数
+#   - carla_relay.config: 语义类别表 / 类别预设映射 / 帧间隔常量
+#   - carla_relay.perception.semantics: 语义类别映射纯函数
 #   - carla_relay.core.sse: SSE 订阅者 hub
 #   - carla_relay.core.sensors: 传感器帧序列化
 #   - carla_relay.core.carla_client: CARLA 连接与进程管理
@@ -180,12 +180,12 @@ from carla_relay.config import (
     FRAME_INTERVAL,
     SEMANTIC_CLASSES as _SEMANTIC_CLASSES,
     SEMANTIC_PALETTE as _SEMANTIC_PALETTE,
-    SEMANTIC_LEVELS as _SEMANTIC_LEVELS,
-    SEMANTIC_LEVEL_LABELS as _SEMANTIC_LEVEL_LABELS,
+    SEMANTIC_PRESETS as _SEMANTIC_PRESETS,
+    SEMANTIC_PRESET_LABELS as _SEMANTIC_PRESET_LABELS,
 )
 from carla_relay.perception.semantics import (
     dynamic_class as _dynamic_class,
-    label_semantic_level as _label_semantic_level,
+    label_semantic_classes as _label_semantic_classes,
     colors_from_labels as _colors_from_labels,
     ratios_from_labels as _ratios_from_labels,
 )
@@ -349,7 +349,7 @@ def _sensor_callback(sid: int, dtype: str, data: Any):
             # 避免在此处写原始 CityScapes 彩图覆盖分级结果。
             _semantic_raw[sid] = payload
         elif dtype == "instance":
-            _instance_raw[sid] = payload  # 原始 BGRA，L3 动态细分在主循环解码
+            _instance_raw[sid] = payload  # 原始 BGRA，22 类动态细分在主循环解码
         else:
             _sensor_frames[sid] = payload
             if fnum is not None:
@@ -372,7 +372,7 @@ _stream_camera_right: Optional[int] = None # 右相机（实验4三目）
 _stream_semantic: Optional[int] = None
 _stream_bird: Optional[int] = None  # 高空俯视相机（跟随车辆，真实渲染俯瞰画面）
 _stream_bbox: Optional[int] = None  # 包围框相机（实验10：前置 RGB + 2D 检测框，参照官方 bounding_boxes.py）
-_semantic_level: str = "L2"  # 当前自动驾驶语义等级（L2 / L3），运行中可切换
+_semantic_preset: str = "7"  # 当前语义分割类别预设（7 / 22），运行中可切换
 _camera_actor_ref: Any = None  # 防止相机 actor 被 GC 导致 listen() 回调失效
 _sensor_refs: Dict[int, Any] = {}  # 保持所有带 listen() 的 sensor actor 引用
 _stream_thread: Optional[threading.Thread] = None

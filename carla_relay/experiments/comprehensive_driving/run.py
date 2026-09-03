@@ -659,7 +659,7 @@ def _run_exp10(args):
 
             # 语义分割帧：原始 CityScapes 标签 → 彩色图写入帧缓存（SSE 推流用）
             render_semantic_frame(sem, _semantic_raw, _sensor_frames, _sensor_frame_num,
-                                  _label_semantic_level, _colors_from_labels)
+                                  _label_semantic_classes, _colors_from_labels)
 
             # 推送实验数据（可视化层组装：鸟瞰车道/参考线/预测轨迹 + 状态帧）
             # 障碍两侧可通行间隙带（口径与 simple_planner 一致 → 所见即决策）。

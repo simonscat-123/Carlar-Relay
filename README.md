@@ -16,7 +16,7 @@ server/                          # 分发本目录即可
 │   ├── __main__.py             # python -m carla_relay 入口
 │   ├── cli.py                  # 按路径加载引导壳并透传 CLI 参数
 │   ├── runtime.py              # 运行时公共工具（AppContext）
-│   ├── config.py               # 常量 / 语义类别 / 分割级别映射
+│   ├── config.py               # 常量 / 语义类别 / 类别预设映射
 │   ├── core/                   # 核心层
 │   │   ├── carla_client.py     #   CARLA 客户端连接 / 进程管理
 │   │   ├── sensors.py          #   传感器装配与帧序列化

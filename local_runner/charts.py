@@ -30,7 +30,7 @@ class LineChart:
     def __init__(self, title: str, series, fmt=None, dynamic=False, max_series=8):
         """series: [(名称, 颜色), ...]；fmt: 数值格式化函数
         dynamic=True 时，遥测里出现的未注册类别会自动加为一条折线
-        （语义分割的类别数随 L2/L3 等级变化，固定系列对不上会导致图例恒为 0）。"""
+        （语义分割的类别数随 7/22 预设变化，固定系列对不上会导致图例恒为 0）。"""
         self.title = title
         self.series = list(series)
         self.data = {name: [] for name, _ in self.series}
@@ -248,13 +248,13 @@ class TelemetryHistory:
                 self.exp10_traj.append("GNSS", gn.get("x"), gn.get("y"))
 
 
-# 语义类别 key → 中文名（对齐服务端 SEMANTIC_CLASSES 与 SEMANTIC_LEVELS 的 L2/L3 类别）
+# 语义类别 key → 中文名（对齐服务端 SEMANTIC_CLASSES 与 SEMANTIC_PRESETS 的 7/22 类预设）
 _RATIO_LABELS = {
-    # L2 类别
+    # 7 类预设
     "background": "背景", "drivable": "可行驶区域", "sidewalk": "人行道",
     "pedestrian": "行人", "vehicle": "车辆", "vehicles": "车辆",
     "traffic_sign": "交通标志", "traffic_light": "信号灯",
-    # L3 类别
+    # 22 类预设
     "unlabeled": "未标注", "building": "建筑", "fence": "栅栏", "pole": "杆状物",
     "vegetation": "植被", "sky": "天空", "road": "道路", "road_line": "车道线",
     "wall": "墙体", "rider": "骑行者", "car": "轿车", "truck": "卡车",

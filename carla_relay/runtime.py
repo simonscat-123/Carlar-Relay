@@ -40,7 +40,7 @@ class AppContext:
     sensor_frame_num: Dict[int, int] = field(default_factory=dict)  # sid -> CARLA 帧号
     sensor_dtype: Dict[int, str] = field(default_factory=dict)      # "camera"|"lidar"|...
     semantic_raw: Dict[int, bytes] = field(default_factory=dict)    # 原始 BGRA（占比统计）
-    instance_raw: Dict[int, bytes] = field(default_factory=dict)    # 原始 BGRA（L3 细分）
+    instance_raw: Dict[int, bytes] = field(default_factory=dict)    # 原始 BGRA（22 类细分）
 
     # 同步模式切换前的旧 settings（用于恢复）
     old_settings: Any = None

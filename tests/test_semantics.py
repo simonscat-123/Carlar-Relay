@@ -13,11 +13,11 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from carla_relay.config import FRAME_INTERVAL, SEMANTIC_LEVELS
+from carla_relay.config import FRAME_INTERVAL, SEMANTIC_PRESETS
 from carla_relay.perception.semantics import (
     colors_from_labels,
     dynamic_class,
-    label_semantic_level,
+    label_semantic_classes,
     ratios_from_labels,
 )
 
@@ -36,11 +36,11 @@ def test_dynamic_class():
     assert dynamic_class("vehicle.tesla.model3") == "car"  # 默认兜底
 
 
-def test_label_semantic_level_l2():
+def test_label_semantic_classes_7():
     # 2x2 标签图：道路(1)、车辆(14)、行人(12)、未标注(0)
     sem = np.array([[1, 14], [12, 0]], dtype=np.int32)
-    labeled = label_semantic_level(sem, "L2")
-    cfg = SEMANTIC_LEVELS["L2"]
+    labeled = label_semantic_classes(sem, "7")
+    cfg = SEMANTIC_PRESETS["7"]
     assert labeled.dtype == np.int32
     assert labeled[0, 0] == cfg["static_map"][1]
     assert labeled[0, 1] == cfg["static_map"][14]
@@ -48,17 +48,17 @@ def test_label_semantic_level_l2():
     assert labeled[1, 1] == cfg["default"]
 
 
-def test_label_semantic_level_l3_static():
-    # L3 无实例分割时退化为静态映射：道路(1)->6、天空(11)->5
+def test_label_semantic_classes_22_static():
+    # 22 类无实例分割时退化为静态映射：道路(1)->6、天空(11)->5
     sem = np.array([[1, 11]], dtype=np.int32)
-    labeled = label_semantic_level(sem, "L3")
-    assert labeled[0, 0] == SEMANTIC_LEVELS["L3"]["static_map"][1]
-    assert labeled[0, 1] == SEMANTIC_LEVELS["L3"]["static_map"][11]
+    labeled = label_semantic_classes(sem, "22")
+    assert labeled[0, 0] == SEMANTIC_PRESETS["22"]["static_map"][1]
+    assert labeled[0, 1] == SEMANTIC_PRESETS["22"]["static_map"][11]
 
 
 def test_colors_from_labels():
     labeled = np.array([[0, 1], [3, 4]], dtype=np.int32)
-    rgb = colors_from_labels(labeled, "L2")
+    rgb = colors_from_labels(labeled, "7")
     assert rgb.shape == (2, 2, 3) and rgb.dtype == np.uint8
     assert tuple(rgb[0, 0]) == (0, 0, 0)
     assert tuple(rgb[0, 1]) == (128, 64, 128)
@@ -66,7 +66,7 @@ def test_colors_from_labels():
 
 def test_ratios_from_labels():
     labeled = np.array([[1, 1], [0, 0]], dtype=np.int32)
-    ratios = ratios_from_labels(labeled, "L2")
+    ratios = ratios_from_labels(labeled, "7")
     assert ratios["drivable"] == 0.5
     assert ratios["background"] == 0.5
     # 全部类别占比之和应 <= 1

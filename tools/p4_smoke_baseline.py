@@ -29,8 +29,8 @@ CASES = [
     ("GET", "/actors", None),
     ("GET", "/vehicle/999/autopilot", None),
     ("GET", "/sensor/999/frame", None),
-    ("POST", "/experiment/5/level", {"level": "L9"}),
-    ("POST", "/experiment/5/level", {"level": "L3"}),
+    ("POST", "/experiment/5/classes", {"classes": "999"}),
+    ("POST", "/experiment/5/classes", {"classes": "22"}),
     ("POST", "/experiment/10/params", {"kp_steer": 0.5, "perception": True}),
     ("POST", "/experiment/1/stop", None),
     ("POST", "/experiment/23/stop", None),
@@ -56,7 +56,7 @@ def main() -> int:
     out["globals"] = {
         "stream_vehicle": m._stream_vehicle,
         "stream_camera": m._stream_camera,
-        "semantic_level": m._semantic_level,
+        "semantic_preset": m._semantic_preset,
         "exp10_ctrl": {k: m._EXP10_CTRL[k] for k in sorted(m._EXP10_CTRL)},
         "exp_log_tail": m._EXP_LOG[-3:],
     }

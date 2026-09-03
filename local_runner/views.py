@@ -544,8 +544,8 @@ def render_semantic(screen, fonts, surfaces, exp, hist: TelemetryHistory, ctx):
     pygame.draw.rect(screen, PANEL_BG, srect)
     pygame.draw.rect(screen, PANEL_BORDER, srect, 1)
     screen.blit(fonts["md"].render("统计信息", True, TEXT), (srect[0] + 8, srect[1] + 6))
-    level = traj.get("level") or ctx.get("params", {}).get("level", "—")
-    lines = [f"自动驾驶等级 {level}"]
+    classes = traj.get("classes") or ctx.get("params", {}).get("classes", "—")
+    lines = [f"语义分割类别数 {classes}"]
     d = traj.get("decision")
     if d:
         lines += [f"决策 {d.get('state', '—')} · {d.get('label', '')}",

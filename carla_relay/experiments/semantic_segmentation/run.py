@@ -62,7 +62,7 @@ _EXP05_LOCK = threading.Lock()
 
 
 def _run_exp05(args):
-    global _EXP05_RUNNING, _EXP05_ABORT, _EXP_CURRENT_ID, _stream_camera, _stream_vehicle, _stream_semantic, _semantic_level
+    global _EXP05_RUNNING, _EXP05_ABORT, _EXP_CURRENT_ID, _stream_camera, _stream_vehicle, _stream_semantic, _semantic_preset
     _EXP_CURRENT_ID = 5
     _EXP05_RUNNING = True
     _EXP05_ABORT = False
@@ -74,10 +74,10 @@ def _run_exp05(args):
     duration = float(args.get("duration", 20.0))
     fixed_delta = float(args.get("fixed_delta", 0.05))
     seed = int(args.get("seed", 7))
-    level = str(args.get("level", "L2")).upper()
-    if level not in _SEMANTIC_LEVELS:
-        level = "L2"
-    _semantic_level = level
+    classes = str(args.get("classes", "7"))
+    if classes not in _SEMANTIC_PRESETS:
+        classes = "7"
+    _semantic_preset = classes
     # 感知融合 → BEV 构建参数（task 参数可覆盖）
     perc_range = float(args.get("perception_range", 50.0))
     sem_range = float(args.get("semantic_range", 40.0))
@@ -249,7 +249,7 @@ def _run_exp05(args):
             snap = world.get_snapshot()
             t = snap.timestamp.elapsed_seconds
 
-            level = _semantic_level  # 当前等级（可被 /experiment/5/level 实时切换）
+            classes = _semantic_preset  # 当前类别预设（可被 /experiment/5/classes 实时切换）
 
             # 语义标签图（CityScapes）
             sem_labels = None
@@ -300,18 +300,18 @@ def _run_exp05(args):
 
             ratios = {}
             if sem_labels is not None:
-                labeled = _label_semantic_level(sem_labels, level, instance, world)
-                ratios = _ratios_from_labels(labeled, level)
-                rgb = _colors_from_labels(labeled, level)
+                labeled = _label_semantic_classes(sem_labels, classes, instance, world)
+                ratios = _ratios_from_labels(labeled, classes)
+                rgb = _colors_from_labels(labeled, classes)
                 img = PIL.Image.fromarray(rgb, mode="RGB")
                 buf = io.BytesIO()
                 img.save(buf, format="JPEG", quality=85)
                 _sensor_frames[sem.id] = buf.getvalue()
                 _sensor_frame_num[sem.id] = i + 1
 
-            rows.append({"frame": i + 1, "time": t, "level": level, **ratios})
+            rows.append({"frame": i + 1, "time": t, "classes": classes, **ratios})
             if i % 4 == 0:
-                pt = {"frame": i + 1, "t": round(t, 3), "progress": round((i + 1) / total * 100, 1), "level": level}
+                pt = {"frame": i + 1, "t": round(t, 3), "progress": round((i + 1) / total * 100, 1), "classes": classes}
                 pt.update({k + "_ratio": v for k, v in ratios.items()})
                 pt["targets"] = len(targets)
                 _obs5 = []
@@ -440,13 +440,13 @@ def experiment_5_stop():
     return jsonify({"status": "ok", "message": "实验5 停止请求已发送"})
 
 
-@app.route("/experiment/5/level", methods=["POST"])
-def experiment_5_level():
-    global _semantic_level
+@app.route("/experiment/5/classes", methods=["POST"])
+def experiment_5_classes():
+    global _semantic_preset
     args = request.get_json(silent=True) or {}
-    level = str(args.get("level", "")).upper()
-    if level not in _SEMANTIC_LEVELS:
-        return jsonify({"status": "error", "message": f"未知等级: {level}", "current": _semantic_level}), 400
-    _semantic_level = level
-    return jsonify({"status": "ok", "level": _semantic_level, "message": f"已切换到 {level} 语义分割"})
+    classes = str(args.get("classes", ""))
+    if classes not in _SEMANTIC_PRESETS:
+        return jsonify({"status": "error", "message": f"未知类别预设: {classes}", "current": _semantic_preset}), 400
+    _semantic_preset = classes
+    return jsonify({"status": "ok", "classes": _semantic_preset, "message": f"已切换到 {classes} 类语义分割"})
 

@@ -493,7 +493,7 @@ def overlay_3d_boxes(*, vehicle, fused_loc, fused_yaw_deg, obstacles, reference,
 
 
 def render_semantic_frame(sem, semantic_raw, sensor_frames, sensor_frame_num,
-                          label_semantic_level, colors_from_labels):
+                          label_semantic_classes, colors_from_labels):
     """语义分割帧：原始 CityScapes 标签 → 彩色图写入帧缓存，供 SSE 推流
     （前端可在相机视角下拉切到语义画面；未连接/无帧时前端回退 Mock）。"""
     if sem.id in semantic_raw:
@@ -502,7 +502,7 @@ def render_semantic_frame(sem, semantic_raw, sensor_frames, sensor_frame_num,
             sem_w = int(sem.attributes["image_size_x"])
             sem_arr = np.frombuffer(semantic_raw[sem.id], dtype=np.uint8).reshape((sem_h, sem_w, 4))
             sem_labels = sem_arr[:, :, 2].astype(np.int32)
-            sem_rgb = colors_from_labels(label_semantic_level(sem_labels, "L2"), "L2")
+            sem_rgb = colors_from_labels(label_semantic_classes(sem_labels, "7"), "7")
             sem_buf = io.BytesIO()
             PIL.Image.fromarray(sem_rgb, mode="RGB").save(sem_buf, format="JPEG", quality=85)
             sensor_frames[sem.id] = sem_buf.getvalue()

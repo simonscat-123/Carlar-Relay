@@ -6,7 +6,7 @@
   "describe": "多传感器语义分割 + 感知融合构建 BEV 占据栅格世界，并基于栅格做规划决策",
   "params": {
     "duration": 40,
-    "level": "L3",
+    "classes": "7",
     "perception_range": 50,
     "semantic_range": 40,
     "bev_span": 100,
