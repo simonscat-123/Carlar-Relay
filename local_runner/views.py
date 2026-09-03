@@ -10,11 +10,12 @@
 """
 from __future__ import annotations
 
+import base64
 import math
 
 import pygame
 
-from .charts import TelemetryHistory
+from .charts import PANEL_BG, PANEL_BORDER, TEXT, TEXT_DIM, TelemetryHistory
 from .relay_client import decode_frame_b64, img_bytes_to_surface
 
 HUD_BG = (28, 33, 48)
@@ -302,44 +303,144 @@ def render_lidar(screen, fonts, surfaces, exp, hist: TelemetryHistory, ctx):
 # ═══════════════════════════════════════════════════════════════════
 # 实验 5 语义分割
 # ═══════════════════════════════════════════════════════════════════
+# ── 实验5：语义分割 → 感知融合 → BEV 占据栅格世界 → 规划决策 ─────────
+# BEV 单元类别 → 颜色（对齐服务端 bev.py 的类别编码 0/1/2/3/4）
+_BEV_CELL_COLORS = {
+    0: (26, 30, 44),    # 未知 / 未感知
+    1: (50, 190, 118),  # 可行驶
+    2: (180, 126, 54),  # 静态障碍
+    3: (240, 96, 96),   # 车辆
+    4: (210, 132, 232), # 行人
+}
+_BEV_CACHE = {}         # cell 数据(base64) → 小尺寸栅格 Surface（避免逐帧重建）
+
+
+def _bev_small_surface(bev):
+    """把 base64 栅格解码为 G×G 小 Surface；返回 (surface_or_None, G)。"""
+    data = bev.get("data")
+    G = bev.get("w") or 0
+    if not data or G <= 0:
+        return None, 0
+    if data in _BEV_CACHE:
+        return _BEV_CACHE[data], G
+    try:
+        raw = base64.b64decode(data)
+    except Exception:
+        return None, 0
+    if len(_BEV_CACHE) > 8:
+        _BEV_CACHE.clear()
+    surf = pygame.Surface((G, G))
+    for idx, b in enumerate(raw):
+        a0, a1 = idx // G, idx % G
+        # lat 左正：a1→左(屏幕小x)，故用 G-1-a1 镜像；前向 a0→上方如旧
+        surf.set_at((G - 1 - a1, G - 1 - a0), _BEV_CELL_COLORS.get(b, (26, 30, 44)))
+    _BEV_CACHE[data] = surf
+    return surf, G
+
+
+def _draw_bev_panel(screen, rect, traj, font):
+    """BEV 鸟瞰栅格面板 + 规划轨迹 / 自车标记叠加。
+
+    仅前方 90° 做了感知融合，画面数据集中在前向可视锥内；自车标记下移至
+    面板 4/5 高度，使纵向可视锥露出的可行驶 / 障碍区域更大，便于观察决策。
+    """
+    pygame.draw.rect(screen, PANEL_BG, rect)
+    pygame.draw.rect(screen, PANEL_BORDER, rect, 1)
+    screen.blit(font.render("BEV 占据栅格世界", True, TEXT), (rect[0] + 8, rect[1] + 5))
+    inner = (rect[0] + 8, rect[1] + 30, rect[2] - 16, rect[3] - 38)
+    bev = traj.get("bev") or {}
+    surf, G = _bev_small_surface(bev)
+    if surf is None or inner[2] < 4 or inner[3] < 4:
+        _placeholder(screen, font, inner, _loading_text(traj, "等待画面…"))
+        return
+    span = bev.get("span") or 60.0
+    res = (bev.get("res") or 0.5) or 0.5            # 栅格分辨率（m），兜底 0.5
+    pm = inner[2] / span                            # 米 → 像素
+    cx = inner[0] + inner[2] / 2
+    cy = inner[1] + inner[3] * 0.8                  # 自车下移，前方可视锥露出更多
+
+    # 底图栅格同样以 (cx, cy) 为自车中心、按米→像素精确摆放（不再中心平铺），
+    # 使栅格自车行 / 叠加轨迹 / 自车标记完全对齐
+    cell_px = pm * res
+    gpx = int(G * cell_px)
+    g0x, g0y = int(cx - gpx / 2), int(cy - gpx / 2)
+    if gpx != (inner[2], inner[3]):
+        g = pygame.transform.smoothscale(surf, (gpx, gpx))
+    prev_clip = screen.get_clip()
+    screen.set_clip(inner)
+    screen.blit(g, (g0x, g0y))
+    screen.set_clip(prev_clip)
+
+    def sc(x, y):                                   # 车体系(x前向, y左) → 屏幕（左在左）
+        return (cx - y * pm, cy - x * pm)
+
+    dec = traj.get("decision") or {}
+    pts = dec.get("traj") or []
+    if len(pts) >= 2:
+        pygame.draw.lines(screen, (255, 230, 90), False,
+                          [sc(float(p["x"]), float(p["y"])) for p in pts], 3)
+    ex, ey = sc(0.0, 0.0)
+    pygame.draw.circle(screen, (120, 220, 255), (int(ex), int(ey)), 5)
+    # 决策角标（右上角）
+    if dec.get("label"):
+        lbl = font.render(dec["label"], True, (255, 230, 90))
+        screen.blit(lbl, (rect[0] + rect[2] - lbl.get_width() - 8, rect[1] + 5))
+
+
 def render_semantic(screen, fonts, surfaces, exp, hist: TelemetryHistory, ctx):
     w, h = screen.get_size()
-    # 顶部：RGB + 语义 双画面对齐铺满整行
-    pane_w = (w - 24) // 2
+    gap, mg = 8, 8
+    pane_w = 456
+    top_y, top_h = 8, 404
+
+    # 顶部三栏：前视 RGB 叠加检测框 | 语义着色 | BEV 鸟瞰栅格
     for i, slot in enumerate(("camera", "semantic")):
-        rect = (8 + i * (pane_w + 8), 8, pane_w, 400)
+        rect = (mg + i * (pane_w + gap), top_y, pane_w, top_h)
         surf = _slot_surf(surfaces, slot)
         if surf is not None:
             _blit_cover(screen, surf, rect)
         else:
             _placeholder(screen, fonts["md"], rect, _loading_text(exp, "等待画面…"))
+    _draw_bev_panel(screen, (mg + 2 * (pane_w + gap), top_y, pane_w, top_h),
+                    exp.get("trajectory") or {}, fonts["sm"])
 
-    # 中部：占比图横跨整行
-    chart_y = 420
-    chart_h = 230
-    hist.exp5_ratio.draw(screen, fonts["sm"], (8, chart_y, w - 16, chart_h))
+    # 底部三栏：语义占比 | BEV 栅格构成 | 决策 + 目标数
+    chart_y = top_y + top_h + gap
+    chart_h = h - chart_y - mg
+    hist.exp5_ratio.draw(screen, fonts["sm"], (mg, chart_y, pane_w, chart_h))
+    hist.exp5_grid.draw(screen, fonts["sm"], (mg + (pane_w + gap), chart_y, pane_w, chart_h))
 
-    # 底部：状态面板整行叠放（图表在上、状态在下，上下布局），填满下方空白
+    drect = (mg + 2 * (pane_w + gap), chart_y, pane_w, chart_h)
+    pygame.draw.rect(screen, PANEL_BG, drect)
+    pygame.draw.rect(screen, PANEL_BORDER, drect, 1)
+    screen.blit(fonts["md"].render("规划决策", True, TEXT), (drect[0] + 8, drect[1] + 6))
+    hist.exp5_targets.draw(screen, fonts["sm"], (drect[0] + 8, drect[1] + 34, drect[2] - 16, 110))
+
     traj = exp.get("trajectory") or {}
     res = exp.get("result") or {}
-    # 等级以服务端轨迹推送为准（L2/L3），没有轨迹时回退到参数配置
     level = traj.get("level") or ctx.get("params", {}).get("level", "—")
-    lines = [
-        f"自动驾驶等级 {level}",
-        f"进度 {traj.get('progress', 0):.0f}% · 时刻 {traj.get('t', 0):.0f}s · 帧 {traj.get('frame', '—')}",
-    ]
-    # 当前占比（取前 4 个非零类别）
+    if traj.get("decision"):
+        d = traj["decision"]
+        lines = [
+            f"决策 {d.get('state', '—')} · {d.get('label', '')}",
+            f"原因 {d.get('reason', '—')}",
+            f"目标横向 {d.get('target_lat', 0):+.1f}m · 占用 {d.get('block_m', '—')}m",
+        ]
+    else:
+        lines = ["等待感知…"]
+    lines.insert(0, f"自动驾驶等级 {level} · 目标 {traj.get('targets', 0)}")
+    lines.append(f"进度 {traj.get('progress', 0):.0f}% · t {traj.get('t', 0):.0f}s")
     ratios = [(k[:-len("_ratio")], v) for k, v in traj.items()
               if k.endswith("_ratio") and isinstance(v, (int, float))]
     ratios.sort(key=lambda kv: -kv[1])
     if ratios:
-        lines.append("占比 " + " · ".join(f"{k} {v * 100:.0f}%" for k, v in ratios[:4]))
+        lines.append("占比 " + " · ".join(f"{k} {v * 100:.0f}%" for k, v in ratios[:3]))
     if res:
         lines.insert(0, f"完成 · 采样 {res.get('rows', '—')} 行 · 用时 {res.get('elapsed', '—')}s")
     done = "实验结束（ESC 退出）" if exp.get("status") in ("done", "stopped") else (
         "出错：" + str(exp.get("message", "")) if exp.get("status") == "error" else None)
-    hud_y = chart_y + chart_h + 16
-    _hud_lines(screen, fonts["sm"], (8, hud_y, w - 16, h - hud_y - 8), lines, done)
+    _hud_lines(screen, fonts["sm"], (drect[0] + 8, drect[1] + 150,
+                                     drect[2] - 16, drect[3] - 150), lines, done)
 
 
 # ═══════════════════════════════════════════════════════════════════

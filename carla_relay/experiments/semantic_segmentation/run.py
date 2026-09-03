@@ -6,6 +6,12 @@
 # 实验 5: 视觉与语义分割
 # =============================================================================
 
+# 感知融合 → BEV 占据栅格世界 → 基于栅格的规划（真实模块，绝对路径导入）
+from carla_relay.experiments.semantic_segmentation.fusion import perceive as _exp5_perceive
+from carla_relay.experiments.semantic_segmentation.bev import BevBuilder as _exp5_BevBuilder
+from carla_relay.experiments.semantic_segmentation.grid_planner import GridPlanner as _exp5_GridPlanner
+from carla_relay.experiments.comprehensive_driving.viz import render_perceived_frame as _exp5_render_perceived
+
 _EXP05_RUNNING = False
 _EXP05_ABORT = False
 _EXP05_THREAD = None
@@ -29,6 +35,22 @@ def _run_exp05(args):
     if level not in _SEMANTIC_LEVELS:
         level = "L2"
     _semantic_level = level
+    # 感知融合 → BEV 构建参数（task 参数可覆盖）
+    perc_range = float(args.get("perception_range", 50.0))
+    bev_span = float(args.get("bev_span", 60.0))
+    bev_res = float(args.get("bev_res", 0.5))
+
+    cam_fov = 90.0   # 语义/实例相机 FOV（度）
+    cam_pitch = -5.0  # 相机安装俯仰（负值向下，供地面逆投影 / 单目测距）
+    cam_height = 1.7  # 相机离地高度（m）
+
+    _exp5_rgb_raw = {}  # 前相机原始 BGRA（供检测框叠加）
+
+    # 感知融合 / BEV 世界 / 基于栅格的规划器（每 tick 复用）
+    bev = _exp5_BevBuilder(span=bev_span, res=bev_res, cam_fov=cam_fov,
+                           cam_pitch=cam_pitch, cam_height=cam_height,
+                           perc_range=perc_range, subsample=2)
+    planner = _exp5_GridPlanner()
 
     actors = []
     try:
@@ -47,17 +69,18 @@ def _run_exp05(args):
         cam_bp = world.get_blueprint_library().find("sensor.camera.rgb")
         cam_bp.set_attribute("image_size_x", "1280")
         cam_bp.set_attribute("image_size_y", "720")
-        cam = world.spawn_actor(cam_bp, carla.Transform(carla.Location(x=1.5, z=1.8)), attach_to=vehicle)
+        cam_bp.set_attribute("fov", "90")
+        cam = world.spawn_actor(cam_bp, carla.Transform(carla.Location(x=1.5, z=cam_height), carla.Rotation(pitch=cam_pitch)), attach_to=vehicle)
         actors.append(cam)
         _sensor_refs[cam.id] = cam
-        cam.listen(lambda d, sid=cam.id: _sensor_callback(sid, "camera", d))
+        cam.listen(lambda d, sid=cam.id: _sensor_callback(sid, "camera", d) or _exp5_rgb_raw.__setitem__(sid, bytes(d.raw_data)))
         _stream_camera = cam.id
         _stream_vehicle = v_id
 
         sem_bp = world.get_blueprint_library().find("sensor.camera.semantic_segmentation")
         sem_bp.set_attribute("image_size_x", "800")
         sem_bp.set_attribute("image_size_y", "600")
-        sem = world.spawn_actor(sem_bp, carla.Transform(carla.Location(x=1.5, z=1.8)), attach_to=vehicle)
+        sem = world.spawn_actor(sem_bp, carla.Transform(carla.Location(x=1.5, z=cam_height), carla.Rotation(pitch=cam_pitch)), attach_to=vehicle)
         actors.append(sem)
         _sensor_refs[sem.id] = sem
         sem.listen(lambda d, sid=sem.id: _sensor_callback(sid, "semantic", d))
@@ -66,7 +89,7 @@ def _run_exp05(args):
         ins_bp = world.get_blueprint_library().find("sensor.camera.instance_segmentation")
         ins_bp.set_attribute("image_size_x", "800")
         ins_bp.set_attribute("image_size_y", "600")
-        ins = world.spawn_actor(ins_bp, carla.Transform(carla.Location(x=1.5, z=1.8)), attach_to=vehicle)
+        ins = world.spawn_actor(ins_bp, carla.Transform(carla.Location(x=1.5, z=cam_height), carla.Rotation(pitch=cam_pitch)), attach_to=vehicle)
         actors.append(ins)
         _sensor_refs[ins.id] = ins
         ins.listen(lambda d, sid=ins.id: _sensor_callback(sid, "instance", d))
@@ -110,6 +133,32 @@ def _run_exp05(args):
                 actor_ids = arr[:, :, 1].astype(np.uint16) + (arr[:, :, 0].astype(np.uint16) << 8)
                 instance = (sem_ids, actor_ids)
 
+            # ── 感知融合 → BEV 占据栅格世界 → 基于栅格的规划 ──
+            targets = []
+            bev_payload = None
+            grid_stat = None
+            decision = None
+            if ins.id in _instance_raw and sem.id in _semantic_raw:
+                try:
+                    ih = int(ins.attributes["image_size_y"]); iw = int(ins.attributes["image_size_x"])
+                    sh = int(sem.attributes["image_size_y"]); sw = int(sem.attributes["image_size_x"])
+                    inst_arr = np.frombuffer(_instance_raw[ins.id], dtype=np.uint8).reshape((ih, iw, 4))
+                    sem_arr = np.frombuffer(_semantic_raw[sem.id], dtype=np.uint8).reshape((sh, sw, 4))
+                    targets = _exp5_perceive(inst_arr, sem_arr, cam_fov=cam_fov,
+                                             cam_pitch=cam_pitch, cam_height=cam_height,
+                                             perc_range=perc_range, exclude_ids=(vehicle.id,))
+                    cells, grid_stat, bev_payload = bev.build(sem_labels, targets,
+                                                              sem_h=sh, sem_w=sw)
+                    decision = planner.decide(cells, res=bev.res)
+                    # 前视 RGB 叠加检测框（复用综合驾驶 viz 渲染；失败不影响主流程）
+                    if cam.id in _exp5_rgb_raw:
+                        rcw, rch = int(cam.attributes["image_size_x"]), int(cam.attributes["image_size_y"])
+                        _rgb_arr = np.frombuffer(_exp5_rgb_raw[cam.id], dtype=np.uint8).reshape((rch, rcw, 4))
+                        _sensor_frames[cam.id] = _exp5_render_perceived(_rgb_arr, targets, iw, ih)
+                        _sensor_frame_num[cam.id] = _sensor_frame_num.get(cam.id, 0) + 1
+                except Exception as _exp5e:
+                    _exp_log(f"感知融合异常: {_exp5e!r}")
+
             ratios = {}
             if sem_labels is not None:
                 labeled = _label_semantic_level(sem_labels, level, instance, world)
@@ -125,6 +174,15 @@ def _run_exp05(args):
             if i % 4 == 0:
                 pt = {"frame": i + 1, "t": round(t, 3), "progress": round((i + 1) / total * 100, 1), "level": level}
                 pt.update({k + "_ratio": v for k, v in ratios.items()})
+                pt["targets"] = len(targets)
+                pt["grid_stat"] = grid_stat
+                pt["bev"] = bev_payload
+                if decision is not None:
+                    pt["decision"] = {
+                        "state": decision["state"], "label": decision["label"],
+                        "target_lat": decision["target_lat"], "block_m": decision["block_m"],
+                        "reason": decision["reason"], "traj": decision["traj"],
+                    }
                 _push_to_sse({"experiment": {"id": 5, "trajectory": pt}})
 
         _push_to_sse({"experiment": {"id": 5, "result": {"elapsed": round(t if rows else 0, 1), "rows": len(rows)}}})

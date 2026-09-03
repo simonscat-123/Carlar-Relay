@@ -186,6 +186,11 @@ class TelemetryHistory:
             ("点数", C_PURPLE)], fmt=lambda v: f"{v:.0f}")
         self.exp5_ratio = LineChart("语义类别占比", [], dynamic=True, max_series=8,
             fmt=lambda v: f"{v * 100:.0f}%")
+        self.exp5_grid = LineChart("BEV 栅格构成", [
+            ("可行驶", C_GREEN), ("占据", C_RED), ("未知", C_BLUE)],
+            fmt=lambda v: f"{v * 100:.0f}%")
+        self.exp5_targets = LineChart("检测目标数", [
+            ("目标", C_ORANGE)], fmt=lambda v: f"{v:.0f}")
         self.exp10_speed = LineChart("速度 (m/s)", [
             ("实际", C_BLUE), ("期望", C_ORANGE)], fmt=lambda v: f"{v:.1f}")
         self.exp10_err = LineChart("误差 (m)", [
@@ -222,6 +227,14 @@ class TelemetryHistory:
                     if k.endswith("_ratio") and isinstance(v, (int, float)):
                         vals[_ratio_label(k)] = v
                 self.exp5_ratio.append(pt.get("t", 0), vals)
+                # BEV 栅格构成 + 检测目标数
+                gs = pt.get("grid_stat")
+                if isinstance(gs, dict):
+                    self.exp5_grid.append(pt.get("t", 0), {
+                        "可行驶": gs.get("free"), "占据": gs.get("occupied"),
+                        "未知": gs.get("unknown")})
+                if isinstance(pt.get("targets"), (int, float)):
+                    self.exp5_targets.append(pt.get("t", 0), {"目标": pt.get("targets")})
         elif exp_id == 10:
             if exp.get("status") == "running" and exp.get("t") is not None:
                 t = exp.get("t", 0)

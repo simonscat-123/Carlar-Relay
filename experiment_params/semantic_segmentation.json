@@ -3,9 +3,12 @@
   "label": "语义分割",
   "slug": "semantic_segmentation",
   "relay": "http://127.0.0.1:5000",
-  "describe": "多传感器数据的语义分割，按 L2/L3 等级分类目标占比",
+  "describe": "多传感器语义分割 + 感知融合构建 BEV 占据栅格世界，并基于栅格做规划决策",
   "params": {
     "duration": 40,
-    "level": "L2"
+    "level": "L2",
+    "perception_range": 50,
+    "bev_span": 60,
+    "bev_res": 0.5
   }
 }
