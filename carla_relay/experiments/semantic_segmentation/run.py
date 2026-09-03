@@ -204,7 +204,7 @@ _EXP05_LOCK = threading.Lock()
 
 
 def _run_exp05(args):
-    global _EXP05_RUNNING, _EXP05_ABORT, _EXP_CURRENT_ID, _stream_camera, _stream_vehicle, _stream_semantic, _semantic_preset
+    global _EXP05_RUNNING, _EXP05_ABORT, _EXP_CURRENT_ID, _stream_camera, _stream_vehicle, _stream_semantic
     _EXP_CURRENT_ID = 5
     _EXP05_RUNNING = True
     _EXP05_ABORT = False
@@ -219,12 +219,12 @@ def _run_exp05(args):
     classes = str(args.get("classes", "7"))
     if classes not in _SEMANTIC_PRESETS:
         classes = "7"
-    _semantic_preset = classes
     # 感知融合 → BEV 构建参数（task 参数可覆盖）
     perc_range = float(args.get("perception_range", 50.0))
     sem_range = float(args.get("semantic_range", 40.0))
     depth_range = float(args.get("depth_range", 80.0))
-    bev_span = float(args.get("bev_span", 60.0))
+    # BEV 栅格边长：自车位于栅格中心，前向可见 = span/2 → 默认 120 保证前向 60m
+    bev_span = float(args.get("bev_span", 120.0))
     bev_res = float(args.get("bev_res", 0.5))
     npc_count = int(args.get("npc_count", 0))
     walker_count = int(args.get("walker_count", 6))
@@ -279,7 +279,13 @@ def _run_exp05(args):
         cam = world.spawn_actor(cam_bp, carla.Transform(carla.Location(x=1.5, z=cam_height), carla.Rotation(pitch=cam_pitch)), attach_to=vehicle)
         actors.append(cam)
         _sensor_refs[cam.id] = cam
-        cam.listen(lambda d, sid=cam.id: _sensor_callback(sid, "camera", d) or _exp5_rgb_raw.__setitem__(sid, bytes(d.raw_data)))
+        # 相机回调仅缓存原始 BGRA（并保留 dtype 标记），跳过 core 的 JPEG 编码：
+        # 该帧会被 run.py 主循环叠加检测框后重编码回写 _sensor_frames[cam.id]，
+        # 与深度帧独占渲染的做法一致，避免每 tick 多余的一次 1280×720 q70 编码。
+        def _exp5_cam_cb(d, sid=cam.id):
+            _sensor_dtype[sid] = "camera"
+            _exp5_rgb_raw[sid] = bytes(d.raw_data)
+        cam.listen(_exp5_cam_cb)
         _stream_camera = cam.id
         _stream_vehicle = v_id
 
@@ -406,8 +412,6 @@ def _run_exp05(args):
             snap = world.get_snapshot()
             t = snap.timestamp.elapsed_seconds
 
-            classes = _semantic_preset  # 当前类别预设（可被 /experiment/5/classes 实时切换）
-
             # 语义标签图（CityScapes）
             sem_labels = None
             if sem.id in _semantic_raw:
@@ -475,13 +479,7 @@ def _run_exp05(args):
                 labeled = _label_semantic_classes(sem_labels, classes, instance, world)
                 ratios = _ratios_from_labels(labeled, classes)
                 rgb = _colors_from_labels(labeled, classes)
-                # 语义画面：超出 semantic_range 的区域置黑（语义感知距离外不显示）
-                sh, sw = sem_labels.shape
-                fx5 = (sw / 2.0) / _math5.tan(_math5.radians(cam_fov) / 2.0)
-                ys5, xs5 = np.indices((sh, sw)).reshape(2, -1)
-                fwd5 = _exp5_project(ys5, xs5, fx5, sw / 2.0, sh / 2.0,
-                                     _math5.radians(-cam_pitch), cam_height)[0].reshape(sh, sw)
-                rgb = np.where((fwd5 <= sem_range)[..., None], rgb, 0)
+                # 语义画面整幅显示（不再按 semantic_range 距离置黑，避免远景/天空整片变黑）
                 img = PIL.Image.fromarray(rgb, mode="RGB")
                 buf = io.BytesIO()
                 img.save(buf, format="JPEG", quality=85)
@@ -517,11 +515,13 @@ def _run_exp05(args):
                 pt["obstacles"] = _obs5
                 pt["grid_stat"] = grid_stat
                 pt["bev"] = bev_payload
-                try:
-                    pt["lane_edges"] = _exp5_lane_geoms(world, vehicle.get_transform(),
-                                                        front=sem_range)
-                except Exception:
-                    pass
+                if classes == "22":
+                    # 车道线仅在 22 类语义分割下绘制（7 类不产出 → BEV 无车道线）
+                    try:
+                        pt["lane_edges"] = _exp5_lane_geoms(world, vehicle.get_transform(),
+                                                            front=sem_range)
+                    except Exception:
+                        pass
                 if decision is not None:
                     pt["decision"] = {
                         "state": decision["state"], "label": decision["label"],
@@ -629,15 +629,4 @@ def experiment_5_stop():
     global _EXP05_ABORT
     _EXP05_ABORT = True
     return jsonify({"status": "ok", "message": "实验5 停止请求已发送"})
-
-
-@app.route("/experiment/5/classes", methods=["POST"])
-def experiment_5_classes():
-    global _semantic_preset
-    args = request.get_json(silent=True) or {}
-    classes = str(args.get("classes", ""))
-    if classes not in _SEMANTIC_PRESETS:
-        return jsonify({"status": "error", "message": f"未知类别预设: {classes}", "current": _semantic_preset}), 400
-    _semantic_preset = classes
-    return jsonify({"status": "ok", "classes": _semantic_preset, "message": f"已切换到 {classes} 类语义分割"})
 

@@ -22,6 +22,11 @@ def _run_exp07(args):
     sampling_res = float(args.get("sampling_resolution", 2.0))
     noise_std = float(args.get("noise_std", 1.0))
     map_wp_dist = float(args.get("map_waypoint_distance", 1.0))
+    # ── 可配置的规划算法与三类成本惩罚（默认关闭惩罚、保持原始 A* 行为）──
+    algorithm = str(args.get("algorithm", "astar")).lower()
+    lane_change_cost = float(args.get("lane_change_cost", 0.0))
+    intersection_cost = float(args.get("intersection_cost", 0.0))
+    curvature_gain = float(args.get("curvature_gain", 0.0))
     rng = random.Random(seed)
 
     try:
@@ -41,9 +46,30 @@ def _run_exp07(args):
         _exp_log(f"路径: ({a.location.x:.1f}, {a.location.y:.1f}) → ({b.location.x:.1f}, {b.location.y:.1f})")
         _exp_log(f"直线距离: {a.location.distance(b.location):.1f} m")
 
-        # 全局路径规划（A* 简化版：沿 waypoint 拓扑推演）
+        # 全局路径规划（A* 简化版：沿 waypoint 拓扑推演；算法与三类成本惩罚可配置）
+        import numpy as np
         from agents.navigation.global_route_planner import GlobalRoutePlanner
-        grp = GlobalRoutePlanner(carla_map, sampling_res)
+        from agents.navigation.local_planner import RoadOption
+
+        # 只有当某个惩罚 >0 时才启用自定义权重函数，否则用原始 'length'（保持默认行为）
+        if lane_change_cost > 0 or intersection_cost > 0 or curvature_gain > 0:
+            def _cost(u, v, edge):
+                c = edge['length']
+                if edge['type'] in (RoadOption.CHANGELANELEFT, RoadOption.CHANGELANERIGHT):
+                    c += lane_change_cost          # 抑制变道（默认变道边 length=0，免费）
+                if edge['intersection']:
+                    c += intersection_cost          # 抑制穿过路口
+                ev, xv = edge['entry_vector'], edge['exit_vector']
+                if ev is not None and xv is not None:
+                    cosn = np.clip(np.dot(ev, xv) / (np.linalg.norm(ev) * np.linalg.norm(xv)), -1, 1)
+                    c += curvature_gain * np.arccos(cosn)   # 弯越急代价越高 → 偏直路
+                return c
+            weight_fn = _cost
+        else:
+            weight_fn = None
+
+        _exp_log(f"规划算法: {algorithm} | 变道惩罚={lane_change_cost} 路口惩罚={intersection_cost} 弯道惩罚={curvature_gain}")
+        grp = GlobalRoutePlanner(carla_map, sampling_res, algorithm=algorithm, weight_fn=weight_fn)
         route = grp.trace_route(a.location, b.location)
         if not route:
             raise RuntimeError("路径规划失败：无可行路径")

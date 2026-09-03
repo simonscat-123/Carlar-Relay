@@ -292,17 +292,14 @@ def _sse_stream_thread():
                         pass
             if sensors:
                 msg["sensors"] = sensors
-            # 深度相机帧（独立于 RGB 相机流）
-            for sid, raw in _sensor_frames.items():
+            # 深度相机帧（独立于 RGB 相机流；与 camera/semantic 同口径走 _frame_msg
+            # 做帧号去重：同一帧 2s 内不重复推送，避免暂停/实验结束后仍以 20Hz
+            # 空转重发同一深度帧，超过 2s 重发一次保证新订阅/重连能拿到当前画面）
+            for sid in _sensor_frames:
                 if _sensor_dtype.get(sid) == "depth":
-                    try:
-                        msg["depth"] = {
-                            "sensor_id": sid,
-                            "base64": base64.b64encode(raw).decode(),
-                            "frame_num": _sensor_frame_num.get(sid, 0),
-                        }
-                    except Exception:
-                        pass
+                    m = _frame_msg("depth", sid)
+                    if m is not None:
+                        msg["depth"] = m
                     break  # 只推第一个深度相机
             # 高空俯视相机帧（跟随车辆，真实渲染俯瞰画面）
             m = _frame_msg("bird", _stream_bird)

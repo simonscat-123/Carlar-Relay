@@ -37,10 +37,11 @@ from carla_relay.experiments.comprehensive_driving.params import read
 # 来源: JSON=构造注入 params（/start body→_run_exp10(args)）
 #       CONST=模块级硬编码兜底默认。正文刻意保持少量可调量。
 P_DEC_WIN = ("dec_win", 25.0, float, "JSON")  # 前方阻挡障碍检查范围（m）
-AVOID_MARGIN = 0.1    # 单一横向余量（m）：障碍边 → 本车边（含执行层跟踪误差预算）
-EDGE_MARGIN = 0.2     # 域边界余量（m）：本车边 → 可行驶域边界
+P_AVOID_MARGIN = ("avoid_margin", 0.1, float, "JSON")  # 单一横向余量（m）：障碍边→本车边
+AVOID_MARGIN = P_AVOID_MARGIN[1]  # 模块级默认（viz 未注入参数时的回退常量）
+EDGE_MARGIN = 0.0     # 域边界余量（m）：本车边 → 可行驶域边界
 SEP_MIN = 0.2         # 碰撞安全网的最小横向分离（m）
-OBS_VMAX = 0.5        # 允许几何绕行的障碍最大速度（m/s）
+OBS_VMAX = 0.7        # 允许几何绕行的障碍最大速度（m/s）
 COMFORT_A = 2.5       # 舒适减速度（m/s²）
 MAX_DECEL = 4.0       # 最大减速度（m/s²，与控制层共享量级）
 RAMP_MIN = 5.0        # 横向渐变段最小长度（m，实际按 1.5·v 拉伸）
@@ -64,6 +65,7 @@ class SimplePlanner:
         self._ego_half_w = ego_half_w
         self._ego_half_len = ego_half_len
         self.dec_win = read(params, P_DEC_WIN)  # 避障窗（JSON: dec_win 可覆盖）
+        self.avoid_margin = read(params, P_AVOID_MARGIN)  # 越障横向余量（JSON: avoid_margin 可覆盖）
         self._avoid_prev = False         # 上一帧是否绕行中（开始/结束事件）
         self._fsm_state = "CRUISE"       # 展示标签，无决策依赖
 
@@ -141,7 +143,7 @@ class SimplePlanner:
             l_lo = min(o["l"] - o["half_w"] for o in blockers)
             l_hi = max(o["l"] + o["half_w"] for o in blockers)
             # 剖面完成期限：进入障碍包络前必须完成横向分离
-            s_sep_end = s_rear - self._ego_half_len - AVOID_MARGIN
+            s_sep_end = s_rear - self._ego_half_len - self.avoid_margin
             committed = abs(ego_l) > COMMITTED_L
             avail = s_sep_end - ego_s
             if avail < ramp:
@@ -155,12 +157,12 @@ class SimplePlanner:
             cands = []
             for iv_lo, iv_hi in self._probe_drivable(s_mid, aggressive_on):
                 # 右侧候选：障碍右缘 + 本车宽 + 余量，且整体落入探测区间
-                l_t = max(l_hi + self._ego_half_w + AVOID_MARGIN,
+                l_t = max(l_hi + self._ego_half_w + self.avoid_margin,
                           iv_lo + self._ego_half_w + EDGE_MARGIN)
                 if l_t <= iv_hi - self._ego_half_w - EDGE_MARGIN:
                     cands.append((l_t, 1))
                 # 左侧候选：障碍左缘 − 本车宽 − 余量，同理
-                l_t = min(l_lo - self._ego_half_w - AVOID_MARGIN,
+                l_t = min(l_lo - self._ego_half_w - self.avoid_margin,
                           iv_hi - self._ego_half_w - EDGE_MARGIN)
                 if l_t >= iv_lo + self._ego_half_w + EDGE_MARGIN:
                     cands.append((l_t, -1))

@@ -7,11 +7,11 @@
   "params": {
     "duration": 40,
     "classes": "22",
-    "perception_range": 30,
-    "semantic_range": 30,
+    "perception_range": 60,
+    "semantic_range": 60,
     "depth_range": 20,
-    "bev_span": 100,
-    "bev_res": 0.25,
+    "bev_span": 60,
+    "bev_res": 0.5,
     "npc_count": 20,
     "walker_count": 6
   }

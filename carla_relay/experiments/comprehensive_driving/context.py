@@ -57,7 +57,9 @@ class Exp10Context:
     def __repr__(self) -> str:  # 调试检视用
         vid = self.vehicle.id if self.vehicle is not None else None
         n_wp = len(self.reference.route_wp) if self.reference is not None else 0
-        return (f"<Exp10Context vehicle={vid} waypoints={n_wp} "
-                f"layers={'/'.join(n for n in ('localizer', 'perceiver', 'predictor',
-                                               'planner', 'controller')
-                                 if getattr(self, n) is not None)}>")
+        # 提前抽离已挂载层的拼接逻辑
+        mounted_layers = '/'.join(
+            n for n in ('localizer', 'perceiver', 'predictor', 'planner', 'controller')
+            if getattr(self, n) is not None
+        )
+        return f"<Exp10Context vehicle={vid} waypoints={n_wp} layers={mounted_layers}>"

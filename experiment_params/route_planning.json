@@ -1,0 +1,18 @@
+{
+  "experiment_id": 7,
+  "label": "导航地图与路径规划",
+  "slug": "route_planning",
+  "relay": "http://127.0.0.1:5000",
+  "describe": "全局路径规划 + 地图匹配：A*/Dijkstra/BFS 三算法可选，三类成本惩罚可调",
+  "params": {
+    "seed": 7,
+    "sampling_resolution": 2.0,
+    "noise_std": 1.0,
+    "map_waypoint_distance": 1.0,
+
+    "algorithm": "astar",
+    "lane_change_cost": 0.0,
+    "intersection_cost": 0.0,
+    "curvature_gain": 0.0
+  }
+}

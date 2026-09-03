@@ -41,6 +41,7 @@ DEFAULT_PARAMS = {
     "lidar_detection": _PARAMS_DIR / "lidar_detection.json",
     "semantic_segmentation": _PARAMS_DIR / "semantic_segmentation.json",
     "comprehensive_driving": _PARAMS_DIR / "comprehensive_driving.json",
+    "route_planning": _PARAMS_DIR / "route_planning.json",
 }
 
 # 提高纵向分辨率以容纳下方图表与状态面板，避免压缩/遮挡并减少留白
@@ -230,7 +231,7 @@ def main(argv=None) -> int:
         prog="local_runner",
         description="命令行 + pygame 的 CARLA 实验纯体验仿真客户端",
     )
-    parser.add_argument("experiment", nargs="?", help="实验 slug：localization / lidar_detection / semantic_segmentation / comprehensive_driving")
+    parser.add_argument("experiment", nargs="?", help="实验 slug：localization / lidar_detection / semantic_segmentation / comprehensive_driving / route_planning")
     parser.add_argument("--params", help="参数 JSON 文件路径（缺省用 server/experiment_params/ 下同名文件）")
     parser.add_argument("--relay", help="relay 服务地址，如 http://127.0.0.1:5000（覆盖参数文件内 relay 字段）")
     parser.add_argument("--list", action="store_true", help="列出可用实验与参数")

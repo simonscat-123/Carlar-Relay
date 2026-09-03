@@ -34,7 +34,7 @@ from carla_relay.experiments.comprehensive_driving.planner import (
     TrajectoryPlanner, RED_MARGIN, MAX_DECEL,
 )
 from carla_relay.experiments.comprehensive_driving.simple_planner import (
-    SimplePlanner,
+    SimplePlanner, AVOID_MARGIN,
 )
 from carla_relay.experiments.comprehensive_driving.control import VehicleController
 from carla_relay.experiments.comprehensive_driving.control_v2 import VehicleControllerV2
@@ -395,6 +395,9 @@ def _run_exp10(args):
         else:
             planner = TrajectoryPlanner(reference, predictor, _exp_log, _plan_log,
                                         ego_half_w, ego_half_len, params=exp_params)
+        # 越障横向余量（JSON: avoid_margin 可覆盖）：simple 规划器从注入的
+        # exp_params 读取；legacy 规划器无该量 → 回退模块默认，用于可视化同源。
+        _avoid_margin = getattr(planner, "avoid_margin", AVOID_MARGIN)
         if controller_kind == "v2":
             controller = VehicleControllerV2(kp_steer, lookahead, steer_delay,
                                              brake_force, MAX_DECEL)
@@ -559,6 +562,7 @@ def _run_exp10(args):
                                       obstacles=perc.obstacles, reference=reference,
                                       inst=inst, bird=bird, sensor_frames=_sensor_frames,
                                       inst_frame=_inst_jpeg, sensor_frame_num=_sensor_frame_num,
+                                      avoid_margin=_avoid_margin,
                                       log=_both_log)
 
             # 车速 + Frenet 位姿（先于红绿灯判定与决策规划，供同帧使用）
@@ -666,8 +670,9 @@ def _run_exp10(args):
             # 纯可视化：任何异常不得影响驾驶主循环。
             try:
                 _gap_viz = build_gap_viz(reference, perc.obstacles, ego_half_w,
-                                         ego_half_len, ego_s=ego_s,
-                                         aggressive_on=aggressive_on, log=_both_log)
+                                     ego_half_len, ego_s=ego_s,
+                                     aggressive_on=aggressive_on, log=_both_log,
+                                     avoid_margin=_avoid_margin)
             except Exception:
                 _gap_viz = None
             _push_to_sse(build_sse_payload(

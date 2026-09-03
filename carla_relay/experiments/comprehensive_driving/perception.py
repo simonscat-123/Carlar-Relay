@@ -160,6 +160,32 @@ def camera_perceive(inst_arr, sem_arr, exclude_ids=()):
     return targets
 
 
+def _near_actor_verts(wpx, wpy, world, exclude_id, radius=2.0):
+    """在 (wpx,wpy) 附近 radius 内匹配最近的真实 vehicle/walker，返回其真实包围盒
+    世界顶点（[{x,y,z}]*8）——用于感知模式下给障碍物补齐**真值**顶点，使鸟瞰/检测
+    相机的 3D 框严格贴物，不再依赖 reference.world(s,l) 弧长重建。找不到则返回 None。"""
+    try:
+        if world is None:
+            return None
+        best, bd = None, float("inf")
+        for a in world.get_actors():
+            if a.id == exclude_id:
+                continue
+            tid = a.type_id
+            if not (tid.startswith("vehicle.") or tid.startswith("walker.")):
+                continue
+            al = a.get_location()
+            d = (al.x - wpx) ** 2 + (al.y - wpy) ** 2   # 避免建 Location 对象，平方距离
+            if d < bd:
+                bd, best = d, a
+        if best is None or bd > radius * radius:
+            return None
+        return [{"x": v.x, "y": v.y, "z": v.z}
+                for v in best.bounding_box.get_world_vertices(best.get_transform())]
+    except Exception:
+        return None
+
+
 class Perceiver:
     """感知层：每 tick 扫描障碍（相机闭环 / 世界真值）+ 读取信号灯状态。"""
 
@@ -228,6 +254,7 @@ class Perceiver:
                     "half_w": max(0.3, p["width_m"] / 2.0),
                     "v_s": 0.0,   # 单帧感知无速度估计（多帧跟踪是进阶内容）
                     "lane": lane_id, "cls": p["cls"], "id": None,
+                    "verts": _near_actor_verts(wpx, wpy, self._world, vehicle.id),
                 })
                 obs_list.append({
                     "category": EXP10_PERC_STYLE.get(p["cls"], ("目标",))[0],

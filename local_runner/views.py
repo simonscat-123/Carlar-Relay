@@ -165,19 +165,28 @@ def _cover_pt(rect, sw, sh, u, v):
 
 def _overlay_segs(screen, rect, src, frames):
     """用 payload 下发的 3D 框投影线段即时绘制（同车道线通道，避免 JPEG 闪烁）。
-    frames: [{segs:[[[u,v],[u,v]]...], color:[r,g,b], dashed:bool}], src=(sw,sh)。"""
+    frames: [{segs:[[[u,v],[u,v]]...], color:[r,g,b], dashed:bool}]，u/v 为归一化
+    [0,1]（对应该帧原图 UV）；src=(sw,sh) 为本端实际展示的帧像素尺寸，先乘回
+    像素再 cover 映射到 rect。因 uv 是归一化坐标，任意展示缩放/适配下均精确对齐，
+    与 web 端（contain 适配 × 各自帧尺寸）用同一套几何，双端结果一致。此处再
+    裁剪到 rect，避免盒子角点投影越界时把边框画到相机画面边界之外。"""
     sw, sh = src
-    for f in frames or []:
-        col = tuple(f.get("color") or (255, 255, 255))
-        dashed = bool(f.get("dashed"))
-        for a, b in f.get("segs") or []:
-            p1 = _cover_pt(rect, sw, sh, a[0], a[1])
-            p2 = _cover_pt(rect, sw, sh, b[0], b[1])
-            if dashed:
-                _dashed_polyline(screen, col, [p1, p2], 7, 5, 2)
-            else:
-                pygame.draw.line(screen, col, (int(p1[0]), int(p1[1])),
-                                 (int(p2[0]), int(p2[1])), 2)
+    prev_clip = screen.get_clip()
+    screen.set_clip(rect)
+    try:
+        for f in frames or []:
+            col = tuple(f.get("color") or (255, 255, 255))
+            dashed = bool(f.get("dashed"))
+            for a, b in f.get("segs") or []:
+                p1 = _cover_pt(rect, sw, sh, a[0] * sw, a[1] * sh)
+                p2 = _cover_pt(rect, sw, sh, b[0] * sw, b[1] * sh)
+                if dashed:
+                    _dashed_polyline(screen, col, [p1, p2], 7, 5, 2)
+                else:
+                    pygame.draw.line(screen, col, (int(p1[0]), int(p1[1])),
+                                     (int(p2[0]), int(p2[1])), 2)
+    finally:
+        screen.set_clip(prev_clip)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -364,7 +373,7 @@ def _draw_bev_panel(screen, rect, traj, font):
     """
     pygame.draw.rect(screen, PANEL_BG, rect)
     pygame.draw.rect(screen, PANEL_BORDER, rect, 1)
-    screen.blit(font.render("BEV 占据栅格世界", True, TEXT), (rect[0] + 8, rect[1] + 5))
+    screen.blit(font.render("BEV 前融合", True, TEXT), (rect[0] + 8, rect[1] + 5))
     inner = (rect[0] + 8, rect[1] + 30, rect[2] - 16, rect[3] - 38)
     bev = traj.get("bev") or {}
     surf, G = _bev_small_surface(bev)
@@ -545,7 +554,7 @@ def render_semantic(screen, fonts, surfaces, exp, hist: TelemetryHistory, ctx):
     # 第1行：目标识别(相机叠框) | 语义分割
     for i, slot in enumerate(("camera", "semantic")):
         rect = (mg + i * (pane_w + gap), row1_y, pane_w, row_h)
-        title = "目标识别（叠框）" if slot == "camera" else "语义分割"
+        title = "目标识别" if slot == "camera" else "语义分割"
         _draw_image_panel(screen, rect, _slot_surf(surfaces, slot),
                           title, fonts["md"])
 
@@ -554,7 +563,7 @@ def render_semantic(screen, fonts, surfaces, exp, hist: TelemetryHistory, ctx):
     # 第2行：深度相机 | BEV 占用栅格
     drect = (mg, row2_y, pane_w, row_h)
     _draw_image_panel(screen, drect, _slot_surf(surfaces, "depth"),
-                      "深度相机", fonts["md"])
+                      "LiDAR点云深度", fonts["md"])
     _draw_bev_panel(screen, (mg + (pane_w + gap), row2_y, pane_w, row_h),
                     traj, fonts["sm"])
 
@@ -731,46 +740,39 @@ def _draw_bird_overlay(screen, rect, exp, lanes, font=None):
         pygame.draw.circle(screen, (78, 139, 255), (int(cx), int(cy)), max(5, int(7 * s)), 1)
 
     # 障碍两侧车身可容空间带（后端 build_gap_viz 下发，口径=simple_planner）+
-    # 可容宽标注；绿=带宽≥车宽(可过)，红=不够
-    if VIZ_GAP_BAND:
+    # 可容宽标注；绿=带宽≥车宽(可过)，红=不够；以及 EDGE 边界余量保留区(黄带)。
+    # 合并到一个共享 SRCALPHA 层一次性 blit（同车道 overlay 策略），避免每 side
+    # 每帧创建一个大尺寸 Surface 造成分配/合成抖动——这是障碍一出现就卡+高频闪的根源。
+    if (VIZ_GAP_BAND or VIZ_EDGE_MARGIN):
         gv = exp.get("gap_viz") or {}
-        for sd in gv.get("sides") or []:
-            poly = [to_scr(p[0], p[1]) for p in sd.get("poly", [])]
-            if len(poly) < 3:
-                continue
-            if sd.get("pass"):
-                fill, stroke = (60, 210, 90, 70), (60, 210, 90)
-            else:
-                fill, stroke = (245, 63, 63, 70), (245, 63, 63)
+        sides = gv.get("sides") or []
+        if sides:
             band = pygame.Surface((rect[2], rect[3]), pygame.SRCALPHA)
-            pygame.draw.polygon(band, fill, poly)
-            pygame.draw.polygon(band, stroke, poly, 1)
+            for sd in sides:
+                if VIZ_GAP_BAND:
+                    poly = [to_scr(p[0], p[1]) for p in sd.get("poly", [])]
+                    if len(poly) >= 3:
+                        if sd.get("pass"):
+                            fill, stroke = (60, 210, 90, 70), (60, 210, 90)
+                        else:
+                            fill, stroke = (245, 63, 63, 70), (245, 63, 63)
+                        pygame.draw.polygon(band, fill, poly)
+                        pygame.draw.polygon(band, stroke, poly, 1)
+                if VIZ_EDGE_MARGIN:
+                    ep = sd.get("edge_poly") or []
+                    if len(ep) >= 3:
+                        poly = [to_scr(p[0], p[1]) for p in ep]
+                        pygame.draw.polygon(band, (255, 200, 60, 45), poly)
+                        pygame.draw.polygon(band, (255, 200, 60), poly, 1)
             screen.blit(band, (rect[0], rect[1]))
-            if font is not None:
-                lp = to_scr(sd["label"][0], sd["label"][1])
-                txt = font.render(f"{sd['width']:.1f}", True, stroke)
-                screen.blit(txt, (int(lp[0] - txt.get_width() / 2),
-                                  int(lp[1] - txt.get_height() / 2)))
-
-    # EDGE 边界余量保留区（可容带外侧 → 可行驶域边界，本车不会进入；黄带）
-    if VIZ_EDGE_MARGIN:
-        gv = exp.get("gap_viz") or {}
-        for sd in gv.get("sides") or []:
-            ep = sd.get("edge_poly") or []
-            if len(ep) < 3:
-                continue
-            poly = [to_scr(p[0], p[1]) for p in ep]
-            band = pygame.Surface((rect[2], rect[3]), pygame.SRCALPHA)
-            pygame.draw.polygon(band, (255, 200, 60, 45), poly)
-            pygame.draw.polygon(band, (255, 200, 60), poly, 1)
-            screen.blit(band, (rect[0], rect[1]))
-            # if font is not None:
-            #     mx = sum(p[0] for p in poly) / len(poly)
-            #     my = sum(p[1] for p in poly) / len(poly)
-            #     txt = font.render(f"余量 {sd.get('edge_margin', 0):.0f}m",
-            #                       True, (255, 200, 60))
-            #     screen.blit(txt, (int(mx - txt.get_width() / 2),
-            #                       int(my - txt.get_height() / 2)))
+            # 可容带宽度标注（与带同色）
+            if font is not None and VIZ_GAP_BAND:
+                for sd in sides:
+                    lp = to_scr(sd["label"][0], sd["label"][1])
+                    stroke = (60, 210, 90) if sd.get("pass") else (245, 63, 63)
+                    txt = font.render(f"{sd['width']:.1f}", True, stroke)
+                    screen.blit(txt, (int(lp[0] - txt.get_width() / 2),
+                                      int(lp[1] - txt.get_height() / 2)))
 
     # 自车车宽标注（真实框宽度 = 2×ego_half_w；与可容带带宽对比判断能否通过）
     if VIZ_EGO_CLEAR and font is not None:
