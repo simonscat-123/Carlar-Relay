@@ -35,13 +35,21 @@ def _camera_to_jpeg(data) -> bytes:
 
 
 def _depth_to_jpeg(data) -> bytes:
-    """深度相机：BGRA → 灰度 JPEG（近白远黑，50m 量程）。"""
+    """深度相机：BGRA → 对数灰度 JPEG（近白远黑，0.1~100m 量程）。
+
+    官方文档：3 通道编码 24-bit 距离（less→more: R→G→B）；
+    raw_data 字节序为 B,G,R,A，故 R 通道 = arr[:,:,2]。
+    使用对数刻度提升近处物体的区分度（CARLA carla.ColorConverter.LogarithmicDepth 口径）。"""
     arr = np.frombuffer(data.raw_data, dtype=np.uint8).reshape((data.height, data.width, 4))
-    b, g, r = arr[:, :, 0].astype(np.float32), arr[:, :, 1].astype(np.float32), arr[:, :, 2].astype(np.float32)
-    depth = (b + g * 256.0 + r * 256.0 * 256.0) / (256.0 ** 3 - 1) * 1000.0  # 米
-    inv = np.clip(255.0 * (1.0 - depth / 50.0), 0, 255).astype(np.uint8)
-    gray = np.stack([inv, inv, inv], axis=-1)
-    img = PIL.Image.fromarray(gray)
+    r = arr[:, :, 2].astype(np.float32)
+    g = arr[:, :, 1].astype(np.float32)
+    b = arr[:, :, 0].astype(np.float32)
+    depth = (r + g * 256.0 + b * 256.0 * 256.0) / (256.0 ** 3 - 1.0) * 1000.0  # 米
+    d = np.clip(depth, 0.1, 100.0)
+    log_range = np.log1p(100.0) - np.log1p(0.1)
+    gray = np.clip(255.0 * (1.0 - (np.log1p(d) - np.log1p(0.1)) / log_range),
+                   0, 255).astype(np.uint8)
+    img = PIL.Image.fromarray(np.stack([gray, gray, gray], axis=-1))
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=80)
     return buf.getvalue()

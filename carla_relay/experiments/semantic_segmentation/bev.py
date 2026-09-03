@@ -4,7 +4,7 @@
 逆投影回地面俯视空间，构建以自车为中心的二维占据栅格：
 
    栅格坐标：axis0 = 前向 fwd（自车中心为 G//2，越大越远）
-             axis1 = 横向 lat（左正右负，越大越靠左）
+             axis1 = 横向 lat（右正，越大越靠车右，与综合驾驶一致）
    单元类别：0=未知(视锥外/未感知)  1=可行驶(freespace)  2=静态障碍
              3=车辆  4=行人（2/3/4 均视为占用）
 
@@ -44,7 +44,7 @@ def _project_pixels(mask_ys, mask_xs, fx, u0, v0, tilt_rad, cam_height):
     theta = tilt_rad + delta                               # 相对水平面总俯角
     valid = theta > 0.02
     d = np.where(valid, cam_height / np.tan(np.maximum(theta, 0.02)), np.inf)
-    psi = np.arctan2(u0 - u, fx)                           # 水平方位角（左正）
+    psi = np.arctan2(u - u0, fx)                           # 水平方位角（右正，与综合驾驶一致）
     fwd = d * np.cos(psi)
     lat = d * np.sin(psi)
     return fwd, lat

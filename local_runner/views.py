@@ -91,6 +91,24 @@ def _blit_fit(screen, surf, rect):
     screen.blit(scaled, (rect[0] + (rect[2] - nw) // 2, rect[1] + (rect[3] - nh) // 2))
 
 
+def _draw_image_panel(screen, rect, surf, title, font):
+    """等大相机面板：背景 + 边框 + 标题 + cover 居中画面（与 BEV 面板同构）。"""
+    pygame.draw.rect(screen, PANEL_BG, rect)
+    pygame.draw.rect(screen, PANEL_BORDER, rect, 1)
+    if title:
+        screen.blit(font.render(title, True, TEXT), (rect[0] + 8, rect[1] + 5))
+    inner = (rect[0] + 8, rect[1] + 30, rect[2] - 16, rect[3] - 38)
+    if inner[2] < 4 or inner[3] < 4:
+        return
+    if surf is not None:
+        prev = screen.get_clip()
+        screen.set_clip(inner)
+        _blit_cover(screen, surf, inner)
+        screen.set_clip(prev)
+    else:
+        _placeholder(screen, font, inner, "等待画面…")
+
+
 def _blit_cover(screen, surf, rect):
     """等比缩放铺满矩形并居中裁剪（cover）。"""
     iw, ih = surf.get_size()
@@ -332,8 +350,8 @@ def _bev_small_surface(bev):
     surf = pygame.Surface((G, G))
     for idx, b in enumerate(raw):
         a0, a1 = idx // G, idx % G
-        # lat 左正：a1→左(屏幕小x)，故用 G-1-a1 镜像；前向 a0→上方如旧
-        surf.set_at((G - 1 - a1, G - 1 - a0), _BEV_CELL_COLORS.get(b, (26, 30, 44)))
+        # lat=车右（与综合驾驶鸟瞰/官方坐标系一致）：a1→屏x(车右→右)，前向 a0→屏上
+        surf.set_at((a1, G - 1 - a0), _BEV_CELL_COLORS.get(b, (26, 30, 44)))
     _BEV_CACHE[data] = surf
     return surf, G
 
@@ -367,21 +385,28 @@ def _draw_bev_panel(screen, rect, traj, font):
     if gpx != (inner[2], inner[3]):
         g = pygame.transform.smoothscale(surf, (gpx, gpx))
     prev_clip = screen.get_clip()
+
+    def sc(x, y):                                   # 车体系(x前向, y右) → 屏幕（右在右）
+        return (cx + y * pm, cy - x * pm)
+
     screen.set_clip(inner)
     screen.blit(g, (g0x, g0y))
+    # 车道线叠加（只画白线，参考综合驾驶鸟瞰；data 随 SSE lane_edges 下发）
+    for _gm in (traj.get("lane_edges") or []):
+        for _ekey in ("left", "right"):
+            _line = _gm.get(_ekey) or []
+            if len(_line) >= 2:
+                pygame.draw.lines(screen, (245, 245, 250), False,
+                                  [sc(p[0], p[1]) for p in _line], 2)
     screen.set_clip(prev_clip)
 
-    def sc(x, y):                                   # 车体系(x前向, y左) → 屏幕（左在左）
-        return (cx - y * pm, cy - x * pm)
-
-    dec = traj.get("decision") or {}
-    pts = dec.get("traj") or []
-    if len(pts) >= 2:
-        pygame.draw.lines(screen, (255, 230, 90), False,
-                          [sc(float(p["x"]), float(p["y"])) for p in pts], 3)
+    # 自车标记（点 + 朝向小三角）
     ex, ey = sc(0.0, 0.0)
-    pygame.draw.circle(screen, (120, 220, 255), (int(ex), int(ey)), 5)
+    pygame.draw.circle(screen, (120, 220, 255), (int(ex), int(ey)), 4)
+    pygame.draw.polygon(screen, (120, 220, 255),
+                        [(ex, ey - 8), (ex - 4, ey - 2), (ex + 4, ey - 2)])
     # 决策角标（右上角）
+    dec = traj.get("decision") or {}
     if dec.get("label"):
         lbl = font.render(dec["label"], True, (255, 230, 90))
         screen.blit(lbl, (rect[0] + rect[2] - lbl.get_width() - 8, rect[1] + 5))
@@ -468,13 +493,16 @@ def _draw_obstacle_full_table(screen, fonts, rect, obstacles, total, status):
     gy = y + 26
     gsplit = {5: "Pose", 9: "Size", 11: "Velocity(自车系)", 13: "Accel(自车系)"}
     g_labels = {}
+    # 列宽按窗口可用宽度等比伸缩，避免右侧留白
+    _tw = sum(cw for _l, _k, cw, _f in cols) or 1
+    _K = (x + w - 8 - (x + 8)) / _tw        # 内容区宽 = 右缘-8 减 左缘+8
     col_x = []
     cx = x + 8
     for i, (lab, key, cw, fmt) in enumerate(cols):
         col_x.append(cx)
         if i in gsplit:
             g_labels[cx] = gsplit[i]
-        cx += cw
+        cx += cw * _K
     # 画分组标签
     for gcx, glab in g_labels.items():
         t2 = fonts["sm"].render(glab, True, (150, 165, 195))
@@ -508,59 +536,34 @@ def _draw_obstacle_full_table(screen, fonts, rect, obstacles, total, status):
 def render_semantic(screen, fonts, surfaces, exp, hist: TelemetryHistory, ctx):
     w, h = screen.get_size()
     gap, mg = 8, 8
-    pane_w = 456
-    top_y, top_h = 8, 300                 # 顶部三画面
-    tab_h = 188                           # 中部整宽障碍物表格
+    pane_w = (w - mg * 3) // 2            # 两列，各占约半宽
+    row_h = 300
+    row1_y, row2_y = 8, 8 + row_h + gap
 
-    # 顶部三栏：目标检测RGB(叠框) | 语义分割 | BEV 占用栅格
+    # 第1行：目标识别(相机叠框) | 语义分割
     for i, slot in enumerate(("camera", "semantic")):
-        rect = (mg + i * (pane_w + gap), top_y, pane_w, top_h)
-        surf = _slot_surf(surfaces, slot)
-        if surf is not None:
-            _blit_cover(screen, surf, rect)
-        else:
-            _placeholder(screen, fonts["md"], rect, _loading_text(exp, "等待画面…"))
-    _draw_bev_panel(screen, (mg + 2 * (pane_w + gap), top_y, pane_w, top_h),
-                    exp.get("trajectory") or {}, fonts["sm"])
+        rect = (mg + i * (pane_w + gap), row1_y, pane_w, row_h)
+        title = "目标识别（叠框）" if slot == "camera" else "语义分割"
+        _draw_image_panel(screen, rect, _slot_surf(surfaces, slot),
+                          title, fonts["md"])
 
     traj = exp.get("trajectory") or {}
-    res = exp.get("result") or {}
 
-    # 中部整宽：障碍物列表
-    ta_y = top_y + top_h + gap
-    _dst = (traj.get("decision") or None)
+    # 第2行：深度相机 | BEV 占用栅格
+    drect = (mg, row2_y, pane_w, row_h)
+    _draw_image_panel(screen, drect, _slot_surf(surfaces, "depth"),
+                      "深度相机", fonts["md"])
+    _draw_bev_panel(screen, (mg + (pane_w + gap), row2_y, pane_w, row_h),
+                    traj, fonts["sm"])
+
+    # 整宽：障碍物信息统计表（字段按窗口宽度自适应）
+    ta_y = row2_y + row_h + gap
+    tab_h = h - 8 - ta_y
+    _dst = traj.get("decision") or None
     _table_status = f"识别总数 {traj.get('targets', 0)}" + (
         (" · 决策 " + _dst.get("state", "—")) if _dst else " · 等待感知")
     _draw_obstacle_full_table(screen, fonts, (mg, ta_y, w - 2 * mg, tab_h),
                               traj.get("obstacles") or [], traj.get("targets", 0), _table_status)
-
-    # 底部三栏：语义占比 | BEV 栅格构成 | 统计信息
-    by = ta_y + tab_h + gap
-    bh = h - 8 - by
-    hist.exp5_ratio.draw(screen, fonts["sm"], (mg, by, pane_w, bh))
-    hist.exp5_grid.draw(screen, fonts["sm"], (mg + (pane_w + gap), by, pane_w, bh))
-
-    srect = (mg + 2 * (pane_w + gap), by, pane_w, bh)
-    pygame.draw.rect(screen, PANEL_BG, srect)
-    pygame.draw.rect(screen, PANEL_BORDER, srect, 1)
-    screen.blit(fonts["md"].render("统计信息", True, TEXT), (srect[0] + 8, srect[1] + 6))
-    classes = traj.get("classes") or ctx.get("params", {}).get("classes", "—")
-    lines = [f"语义分割类别数 {classes}"]
-    d = traj.get("decision")
-    if d:
-        lines += [f"决策 {d.get('state', '—')} · {d.get('label', '')}",
-                  f"原因 {d.get('reason', '—')}",
-                  f"目标横向 {d.get('target_lat', 0):+.1f}m · 占用 {d.get('block_m', '—')}m"]
-    else:
-        lines += ["等待感知…"]
-    lines.append(f"进度 {traj.get('progress', 0):.0f}% · t {traj.get('t', 0):.0f}s")
-    if res:
-        lines.insert(0, f"完成 · 采样 {res.get('rows', '—')} 行 · 用时 {res.get('elapsed', '—')}s")
-    done = "实验结束（ESC 退出）" if exp.get("status") in ("done", "stopped") else (
-        "出错：" + str(exp.get("message", "")) if exp.get("status") == "error" else None)
-    _hud_lines(screen, fonts["sm"], (srect[0] + 8, srect[1] + 30,
-                                     srect[2] - 16, srect[3] - 34),
-               lines, done)
 
 
 # ═══════════════════════════════════════════════════════════════════

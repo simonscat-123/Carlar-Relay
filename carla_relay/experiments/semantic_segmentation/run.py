@@ -15,6 +15,77 @@ from carla_relay.experiments.comprehensive_driving.viz import render_perceived_f
 import math as _math5
 
 
+def _exp5_lane_geoms(world, ego_tf, *, front=60.0, step=1.5, fov_deg=90.0):
+    """采样当前车道 + 左右相邻车道的中心线，转自车系（前向x、车右y），返回左右边界。
+
+    返回 [{ "left": [[x,y],...], "right": [[x,y],...] }, ...]，仅保留自车前方 90° 视锥内的点
+    （fwd>0 且 |y|<=fwd*tan(45°)），与 BEV 视锥范围一致。若当前车道两侧无同向邻道，
+    列表只有当前车道一项。
+    """
+    try:
+        wp0 = world.get_map().get_waypoint(ego_tf.location)
+    except Exception:
+        return []
+    if wp0 is None:
+        return []
+
+    # CARLA 世界系 x前 y右 → 自车系 x'=前向, y'=车右：x'=cos·dx+sin·dy, y'=-sin·dx+cos·dy
+    yaw = _math5.radians(ego_tf.rotation.yaw)
+    c0, s0 = _math5.cos(yaw), _math5.sin(yaw)
+    ex, ey = ego_tf.location.x, ego_tf.location.y
+
+    def body(dx, dy):
+        return (dx * c0 + dy * s0, -dx * s0 + dy * c0)
+
+    # 前方 90° 视锥裁剪（±45°）
+    tan_half = _math5.tan(_math5.radians(fov_deg) / 2.0)
+
+    # 当前车道 + 左/右邻道（同 lane_type 才算正向邻道）
+    start_wps = [wp0]
+    for side_fn in (wp0.get_left_lane, wp0.get_right_lane):
+        try:
+            nw = side_fn()
+            if nw is not None and nw.lane_id != wp0.lane_id \
+                    and nw.lane_type == wp0.lane_type:
+                start_wps.append(nw)
+        except Exception:
+            pass
+
+    geoms = []
+    for st in start_wps:
+        w, centers, dist, guard = st, [], 0.0, 0
+        while dist < front and guard < 120:
+            cx_w, cy_w = w.transform.location.x, w.transform.location.y
+            fwd, lat = body(cx_w - ex, cy_w - ey)
+            if fwd > 0 and abs(lat) <= fwd * tan_half:
+                centers.append((fwd, lat))
+            nxt = w.next(step)
+            if not nxt:
+                break
+            nw = nxt[0] if isinstance(nxt, (list, tuple)) else nxt
+            if nw is None:
+                break
+            dist += _math5.hypot(nw.transform.location.x - cx_w,
+                                 nw.transform.location.y - cy_w)
+            w, guard = nw, guard + 1
+        if len(centers) < 2:
+            continue
+        hw = (getattr(st, "lane_width", None) or 3.5) / 2.0
+        left, right = [], []
+        for i, (bx, by) in enumerate(centers):
+            prv = centers[i - 1] if i > 0 else centers[0]
+            nxtc = centers[i + 1] if i + 1 < len(centers) else centers[-1]
+            tx, ty = nxtc[0] - prv[0], nxtc[1] - prv[1]
+            n = _math5.hypot(tx, ty) or 1.0
+            # 中心线切向(tx,ty)，左法向=(-ty,tx)（= 屏上"左"），但 y_body=车右 → 屏右
+            # 这里 lat 已经是车右，所以"左"边界 = lat 减 hw（更靠车中线为小 lat=车左）
+            # 物理上：left/right 是相对车而言
+            left.append([round(bx, 2), round(by - hw, 2)])   # 车左：lat 更小
+            right.append([round(bx, 2), round(by + hw, 2)])  # 车右：lat 更大
+        geoms.append({"left": left, "right": right})
+    return geoms
+
+
 def _exp5_actor_metrics(world, ego, aid, t, vel_state, still_cnt):
     """由真实 actor id 反查完整物理量：pose(全局 xyz/自身 yaw 弧度)、
     size(lwh)、velocity/acceleration(转自车系：前向 vx、左向 vy)、is_static。
@@ -154,10 +225,20 @@ def _run_exp05(args):
         _sensor_refs[ins.id] = ins
         ins.listen(lambda d, sid=ins.id: _sensor_callback(sid, "instance", d))
 
+        # 深度相机（core 侧经 _sensor_dtype=="depth" 自动推送 msg["depth"]）
+        dep_bp = world.get_blueprint_library().find("sensor.camera.depth")
+        dep_bp.set_attribute("image_size_x", "800")
+        dep_bp.set_attribute("image_size_y", "600")
+        dep_bp.set_attribute("fov", "90")
+        dep = world.spawn_actor(dep_bp, carla.Transform(carla.Location(x=1.5, z=cam_height), carla.Rotation(pitch=cam_pitch)), attach_to=vehicle)
+        actors.append(dep)
+        _sensor_refs[dep.id] = dep
+        dep.listen(lambda d, sid=dep.id: _sensor_callback(sid, "depth", d))
+
         for a in actors:
             with _lock:
                 _managed_actors.add(a.id)
-        _exp_log(f"车辆+RGB+语义+实例相机已挂载 (id={v_id})")
+        _exp_log(f"车辆+RGB+语义+实例+深度相机已挂载 (id={v_id})")
 
         # ── 生成 NPC 交通车（官方生成 traffic 的方式：batch 生成 + TM 接管）──
         from carla.command import SpawnActor as _cSpawn, SetAutopilot as _cAuto, \
@@ -331,6 +412,10 @@ def _run_exp05(args):
                 pt["obstacles"] = _obs5
                 pt["grid_stat"] = grid_stat
                 pt["bev"] = bev_payload
+                try:
+                    pt["lane_edges"] = _exp5_lane_geoms(world, vehicle.get_transform())
+                except Exception:
+                    pass
                 if decision is not None:
                     pt["decision"] = {
                         "state": decision["state"], "label": decision["label"],

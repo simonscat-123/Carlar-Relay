@@ -5,7 +5,7 @@
   - 分类：在每目标掩码内用语义分割图投票（车辆 / 行人）；其余类别丢弃；
   - 测距：检测框底边中点视为接地点，针孔模型求相对光轴俯角，叠加相机安装
     俯仰后由 相机高度 / tan(俯角) 反解地面距离；框中心列坐标 → 水平方位角，
-    得到目标在**车体系**的前向 fwd / 横向 lat（左正右负，与真值扫描约定一致）；
+    得到目标在**车体系**的前向 fwd / 横向 lat（右正，与综合驾驶一致）；
   - 融合语义：把目标的类别标签与语义分割在掩码上的投票对齐，作为统一障碍。
 
 输出（车体系前视图，按距离升序）：
@@ -66,7 +66,7 @@ def perceive(inst_arr, sem_arr, *, cam_fov=90.0, cam_pitch=-5.0,
         if dist > perc_range:
             continue                                       # 超出识别距离上限不可信
         u_c = (xmin + xmax) / 2.0
-        psi = math.atan2(u0 - u_c, fx)                     # 水平方位角（左正右负）
+        psi = math.atan2(u_c - u0, fx)                     # 水平方位角（右正，与综合驾驶一致）
         cls = "walker" if n_wal > n_veh else "vehicle"
         targets.append({
             "id": iid,

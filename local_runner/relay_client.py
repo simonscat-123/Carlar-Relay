@@ -179,7 +179,8 @@ class SSEQueue:
             # 相机/语义/鸟瞰/包围框等图像槽位
             for slot, key in (("camera", "camera"), ("bird", "bird"),
                               ("semantic", "semantic"), ("bbox", "bbox"),
-                              ("cameraL", "cameraL"), ("cameraR", "cameraR")):
+                              ("cameraL", "cameraL"), ("cameraR", "cameraR"),
+                              ("depth", "depth")):
                 blk = msg.get(slot)
                 if isinstance(blk, dict) and blk.get("base64"):
                     self._surfaces[slot] = blk["base64"]
