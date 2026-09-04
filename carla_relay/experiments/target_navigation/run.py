@@ -49,8 +49,8 @@ def _run_exp09(args):
                                      z=start_pt.location.z)
 
         # 全局路径
-        from agents.navigation.global_route_planner import GlobalRoutePlanner
-        grp = GlobalRoutePlanner(carla_map, 2.0)
+        from carla_relay.vendor.grp_loader import make_route_planner
+        grp = make_route_planner(carla_map, 2.0)
         route = grp.trace_route(start_pt.location, target_loc)
         if not route or len(route) < 10:
             raise RuntimeError("路径规划失败")

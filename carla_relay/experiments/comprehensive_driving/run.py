@@ -144,10 +144,10 @@ def _run_exp10(args):
     tl_stop_margin = float(args.get("tl_stop_margin", RED_MARGIN))
     tl_brake_window = float(args.get("tl_brake_window", 80.0))
     # 规划/感知可调参数（JSON 覆盖，缺省按各消费层模块头登记默认；构造时注入 params：
-    # simple_planner 避障窗 dec_win=15；legacy 规划器决策窗 dec_win=60；感知距离=50）
+    # simple_planner 避障窗 dec_win=25；legacy 规划器决策窗 dec_win=60；感知距离=50）
     exp_params = {
         "dec_win": float(args.get("dec_win",
-                                  15.0 if planner_kind == "simple" else 60.0)),
+                                  25.0 if planner_kind == "simple" else 60.0)),
         "perception_range": float(args.get("perception_range", 50.0)),
     }
     gps_failure = bool(args.get("gps_failure", False))
@@ -278,7 +278,7 @@ def _run_exp10(args):
         carla_map = world.get_map()
         route_lane_ids = []       # 与 route_wp 平行：各路点所在车道 id（车道级避障判据用）
         try:
-            from agents.navigation.global_route_planner import GlobalRoutePlanner
+            from carla_relay.vendor.grp_loader import make_route_planner, get_grp_source
             # 自定义成本权重：仅当任一惩罚 >0 时启用，否则保持默认按边长度寻路
             weight_fn = None
             if lane_change_cost > 0 or intersection_cost > 0 or curvature_gain > 0:
@@ -299,7 +299,9 @@ def _run_exp10(args):
                     return c
                 weight_fn = _route_cost
             _exp_log(f"全局路线算法={route_algorithm} 变道惩罚={lane_change_cost} 路口惩罚={intersection_cost} 弯道惩罚={curvature_gain}")
-            grp = GlobalRoutePlanner(carla_map, sampling_res, algorithm=route_algorithm, weight_fn=weight_fn)
+            if get_grp_source() == "official":
+                _exp_log("警告：宿主 CARLA 未同步修改版 GlobalRoutePlanner，已退化为官方原版；algorithm 与三类惩罚不生效，仅按最短距离寻路。")
+            grp = make_route_planner(carla_map, sampling_res, algorithm=route_algorithm, weight_fn=weight_fn)
             path = grp.trace_route(start_loc, end_loc)
             route_wp = [wp.transform.location for wp, _ in path]
             route_lane_ids = [(wp.road_id, wp.lane_id) for wp, _ in path]

@@ -201,7 +201,7 @@ def route_plan():
     end_loc = carla.Location(x=float(e.get("x", 0)), y=float(e.get("y", 0)), z=float(e.get("z", 0)))
 
     try:
-        from agents.navigation.global_route_planner import GlobalRoutePlanner
+        from carla_relay.vendor.grp_loader import make_route_planner, get_grp_source
         # 自定义成本权重：仅当任一惩罚 >0 时启用，否则保持默认按边长度寻路
         weight_fn = None
         if lane_change_cost > 0 or intersection_cost > 0 or curvature_gain > 0:
@@ -221,7 +221,7 @@ def route_plan():
                     c += curvature_gain * _np.arccos(cosn)   # 弯越急代价越高
                 return c
             weight_fn = _route_cost
-        grp = GlobalRoutePlanner(world.get_map(), sampling, algorithm=algorithm, weight_fn=weight_fn)
+        grp = make_route_planner(world.get_map(), sampling, algorithm=algorithm, weight_fn=weight_fn)
         path = grp.trace_route(start_loc, end_loc)
         waypoints = []
         total_len = 0.0
@@ -258,6 +258,9 @@ def route_plan():
         return jsonify({
             "status": "ok", "route": waypoints, "obstacles": obstacles,
             "length": round(total_len, 1), "count": len(waypoints),
+            # 向前端提示全局路线规划器实际来源：official 表示宿主 CARLA 未同步
+            # 修改版 global_route_planner，已退化为官方原版（丢失 algorithm/三类惩罚）
+            "grp_source": get_grp_source(),
         })
     except Exception as exc:
         return jsonify({"status": "error", "message": str(exc)}), 500

@@ -14,7 +14,7 @@
 
 【参数来源对照表】（全部为显式参数，规格见各消费模块文件头登记）：
     参数              来源    类型    默认(按消费模块)        消费位置
-    dec_win           JSON     float   15.0 simple_planner     simple_planner._blockers
+    dec_win           JSON     float   25.0 simple_planner     simple_planner._blockers
                                        60.0 planner(legacy)    planner._find_nudge 等
     perception_range  JSON     float   50.0                    perception 感知扫描/bbox 识别距离上限
 """

@@ -48,7 +48,7 @@ def _run_exp07(args):
 
         # 全局路径规划（A* 简化版：沿 waypoint 拓扑推演；算法与三类成本惩罚可配置）
         import numpy as np
-        from agents.navigation.global_route_planner import GlobalRoutePlanner
+        from carla_relay.vendor.grp_loader import make_route_planner
         from agents.navigation.local_planner import RoadOption
 
         # 只有当某个惩罚 >0 时才启用自定义权重函数，否则用原始 'length'（保持默认行为）
@@ -69,7 +69,7 @@ def _run_exp07(args):
             weight_fn = None
 
         _exp_log(f"规划算法: {algorithm} | 变道惩罚={lane_change_cost} 路口惩罚={intersection_cost} 弯道惩罚={curvature_gain}")
-        grp = GlobalRoutePlanner(carla_map, sampling_res, algorithm=algorithm, weight_fn=weight_fn)
+        grp = make_route_planner(carla_map, sampling_res, algorithm=algorithm, weight_fn=weight_fn)
         route = grp.trace_route(a.location, b.location)
         if not route:
             raise RuntimeError("路径规划失败：无可行路径")

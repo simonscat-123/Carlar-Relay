@@ -35,8 +35,8 @@ def _run_exp08(args):
         rng = random.Random(seed)
 
         # 规划路径
-        from agents.navigation.global_route_planner import GlobalRoutePlanner
-        grp = GlobalRoutePlanner(carla_map, 2.0)
+        from carla_relay.vendor.grp_loader import make_route_planner
+        grp = make_route_planner(carla_map, 2.0)
         for _ in range(100):
             a = rng.choice(spawn_pts)
             b = rng.choice(spawn_pts)
