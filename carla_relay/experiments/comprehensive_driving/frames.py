@@ -28,6 +28,7 @@ class LocFrame:
     gnss_yaw_deg: float       # GNSS 观测航向（度，诊断日志用）
     gyro_w: float             # 陀螺角速度（°/s，诊断日志用）
     yaw_a: float              # 航向互补滤波权重（诊断日志用）
+    alpha: float              # 位置互补滤波权重 alpha（GNSS 权重，自适应，SSE 展示用）
     loc_err: float            # 融合位置 vs 真值距离（m，误差评估用）
 
 

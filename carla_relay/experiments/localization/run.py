@@ -13,6 +13,16 @@ _EXP23_THREAD = None
 
 EARTH_RADIUS_M = 6378137.0
 
+# 噪声自适应 alpha 参数（文件头可调）：
+#   NOISE_JITTER          —— 每帧对 IMU/GNSS 噪声标准差施加的比例扰动（±10%），
+#                            使有效噪声逐帧波动，alpha 也随之每帧变化。
+#   ALPHA_MIN / ALPHA_MAX —— alpha 上下限钳制，避免极端 0/1（更信单传感器）导致抖动。
+#   ALPHA_IDLE            —— GNSS/INS 双噪声均≈0 时的中性回退值（此时比值无意义）。
+NOISE_JITTER = 0.10
+ALPHA_MIN = 0.05
+ALPHA_MAX = 0.95
+ALPHA_IDLE = 0.5
+
 
 def _llh_to_local(lat, lon, alt, lat0, lon0, alt0):
     x = math.radians(lon - lon0) * EARTH_RADIUS_M * math.cos(math.radians(lat0))
@@ -62,7 +72,6 @@ def _run_exp23(args):
     settle_seconds = float(args.get("settle_seconds", 1.5))
     launch_seconds = float(args.get("launch_seconds", 2.0))
     launch_throttle = float(args.get("launch_throttle", 0.25))
-    alpha = float(args.get("alpha", 0.08))
     gnss_noise = max(0.0, float(args.get("gnss_noise", 0.0)))
     ins_noise = max(0.0, float(args.get("ins_noise", 0.0)))
     seed = int(args.get("seed", 7))
@@ -249,6 +258,17 @@ def _run_exp23(args):
             if gnss_data is None or imu_data is None:
                 continue
 
+            # --- 噪声自适应 alpha：对 IMU/GNSS 噪声各施加 ±NOISE_JITTER 扰动（每帧波动），
+            # 再由有效噪声反向加权得到 GNSS 权重 alpha——噪声小的一方获得更高信任。
+            # fused = alpha*GNSS + (1-alpha)*INS，故有效 GNSS 噪声更小→alpha 越大越信 GNSS，
+            # 有效 INS 噪声更小→alpha 越小越信 INS。本帧 gauss 采样与融合均使用该有效噪声。 ---
+            eff_gnss = gnss_noise * (1.0 + rng.uniform(-NOISE_JITTER, NOISE_JITTER))
+            eff_ins = ins_noise * (1.0 + rng.uniform(-NOISE_JITTER, NOISE_JITTER))
+            if eff_gnss + eff_ins < 1e-9:
+                alpha = ALPHA_IDLE
+            else:
+                alpha = max(ALPHA_MIN, min(ALPHA_MAX, eff_ins / (eff_gnss + eff_ins)))
+
             # --- 初始化（首帧不跳过，对齐 exp03：dt=1e-3，从 llh_to_local 零位开始积分）---
             if last_t is None:
                 lat0 = gnss_data["latitude"]
@@ -283,8 +303,8 @@ def _run_exp23(args):
             GRAV = 9.81
             g_body = (-GRAV * fwd.z, -GRAV * right.z, -GRAV * up.z)
             acc_meas = imu_data["accelerometer"]
-            ax_body = acc_meas["x"] + g_body[0] + rng.gauss(0, ins_noise)
-            ay_body = acc_meas["y"] + g_body[1] + rng.gauss(0, ins_noise)
+            ax_body = acc_meas["x"] + g_body[0] + rng.gauss(0, eff_ins)
+            ay_body = acc_meas["y"] + g_body[1] + rng.gauss(0, eff_ins)
             az_body = acc_meas["z"] + g_body[2]
             # 旋转到世界系（完整三轴，含 roll/pitch）
             ax_world = ax_body * fwd.x + ay_body * right.x + az_body * up.x
@@ -311,8 +331,8 @@ def _run_exp23(args):
                 gnss_data["latitude"], gnss_data["longitude"], gnss_data["altitude"],
                 lat0, lon0, alt0,
             )
-            gx = gx_raw + rng.gauss(0, gnss_noise)
-            gy = gy_raw + rng.gauss(0, gnss_noise)
+            gx = gx_raw + rng.gauss(0, eff_gnss)
+            gy = gy_raw + rng.gauss(0, eff_gnss)
 
             # GNSS 失锁判定：窗口内无观测，融合退化为纯 INS 推算
             elapsed_exp = tick_idx * fixed_delta
@@ -331,10 +351,10 @@ def _run_exp23(args):
             else:
                 delta_yaw = ((yaw_deg - prev_gt_yaw_deg + 180.0) % 360.0) - 180.0
                 prev_gt_yaw_deg = yaw_deg
-                gyro_w = delta_yaw / dt + rng.gauss(0, ins_noise * 30.0)   # °/s
+                gyro_w = delta_yaw / dt + rng.gauss(0, eff_ins * 30.0)   # °/s
                 ins_yaw_deg = fused_yaw_deg + gyro_w * dt
                 if gnss_valid:
-                    gnss_yaw_deg = yaw_deg + rng.gauss(0, gnss_noise * 4.0)  # 度
+                    gnss_yaw_deg = yaw_deg + rng.gauss(0, eff_gnss * 4.0)  # 度
                     # 用卷绕后的相位差(innovation)做互补滤波，避免 ±180° 边界跳变
                     innov_deg = ((gnss_yaw_deg - ins_yaw_deg + 180.0) % 360.0) - 180.0
                     fused_yaw_deg = ins_yaw_deg + alpha * innov_deg
@@ -404,6 +424,7 @@ def _run_exp23(args):
                 "steer": round(steer, 3),
                 "cte": round(cte_gt, 3),
                 "error": round(err, 3),
+                "alpha": round(alpha, 3),
             }
             trajectory.append(point)
 

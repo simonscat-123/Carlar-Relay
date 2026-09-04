@@ -92,8 +92,10 @@ def _run_exp10(args):
     safe_dist = float(args.get("safe_distance", 12.0))
     gnss_noise = float(args.get("gnss_noise", 1.0))
     ins_noise = float(args.get("ins_noise", 0.1))
-    alpha = float(args.get("alpha", 0.08))
-    _exp_log(f"本次参数: gnssσ={gnss_noise:.2f} insσ={ins_noise:.2f} alpha={alpha:.3f} "
+    # alpha 互补增益不再作为前端参数：改为由 IMU/GNSS 噪声自适应（噪声小的一方信任更高），
+    # 每帧随噪声波动，见 localization.py 顶部 NOISE_JITTER/ALPHA_MIN/ALPHA_MAX/ALPHA_IDLE。
+    _exp_log(f"本次参数: gnssσ={gnss_noise:.2f} insσ={ins_noise:.2f} "
+             f"(alpha 自适应) "
              f"target={target_speed:.1f}m/s lookahead={lookahead:.1f}m kp={kp_steer:.2f}")
     # 感知闭环：开启后障碍物距离由 bbox 相机（实例+语义分割）单目估计，
     # 不再查询世界真值；关闭则沿用真值扫描（两种模式可运行中实时切换对比）
@@ -405,7 +407,7 @@ def _run_exp10(args):
         _exp_log(f"规划调试日志: {_plan_log_path}")
 
         # ── 各层实例（依赖经构造函数显式注入；层间数据经帧契约流动）──
-        localizer = Localizer(gnss_noise, ins_noise, alpha, vehicle.get_location())
+        localizer = Localizer(gnss_noise, ins_noise, vehicle.get_location())
         predictor = ObstaclePredictor()
         if perceiver_kind == "v2":
             # v2 感知：自带绑定（含车道归属），tl_stop_margin/窗口参数化
@@ -464,7 +466,7 @@ def _run_exp10(args):
             "duration": duration, "target_speed": target_speed, "lookahead": lookahead,
             "kp_steer": kp_steer, "steer_delay": steer_delay, "brake_force": brake_force,
             "safe_dist": safe_dist, "gnss_noise": gnss_noise, "ins_noise": ins_noise,
-            "alpha": alpha, "perception": perception_mode, "aggressive": aggressive_mode,
+            "perception": perception_mode, "aggressive": aggressive_mode,
             "gps_failure": gps_failure, "sampling_res": sampling_res,
             "dec_win": exp_params["dec_win"],
             "perception_range": exp_params["perception_range"],
@@ -716,6 +718,8 @@ def _run_exp10(args):
                 viz3d=_viz3d, gap_viz=_gap_viz)
             # 调试：与 bbox3d/bird3d 同通道透出 2D 检测框归一化坐标，供前端对比屏幕坐标
             _payload["bbox2d"] = _bbox_diag.get("uv2d", [])
+            # 透出当前帧自适应 alpha（GNSS 权重）供状态栏动态展示
+            _payload["alpha"] = round(loc.alpha, 3)
             _push_to_sse(_payload)
 
             # 同步模式下 tick 已按固定时间步推进并阻塞至该帧完成，无需额外 sleep

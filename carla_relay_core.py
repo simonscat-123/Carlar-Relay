@@ -222,6 +222,44 @@ def _frame_msg(slot: str, sid: Optional[int]) -> Optional[dict]:
     }
 
 
+# 三目相机原子推送状态：仅当左/前/右三路帧号一致（同一仿真 tick 生成）时
+# 才同时下发三路画面，避免各相机回调完成时刻不同导致前端合成出“混合批次”
+# （一路新帧 + 另两路旧帧 → 画面边界跳变/错位，转弯时左路内容看起来窜到中路）。
+_triplet_last_fn = 0
+_triplet_last_ts = 0.0
+
+
+def _frame_msg_triplet(msg: dict) -> bool:
+    """三路帧号对齐时原子推送 camera/cameraL/cameraR，返回 True。
+
+    与 _frame_msg 相同的 2s 重发窗口：同一批帧 2s 内不重复推送，
+    超过 2s 重发一次保证新订阅/重连客户端能拿到当前画面。
+    任一路未就绪或帧号未对齐时返回 False，调用方回退逐槽推送（保持原行为）。
+    """
+    global _triplet_last_fn, _triplet_last_ts
+    sid_left, sid_front, sid_right = _stream_camera_left, _stream_camera, _stream_camera_right
+    if sid_left is None or sid_front is None or sid_right is None:
+        return False
+    fn_l = _sensor_frame_num.get(sid_left, 0)
+    fn_f = _sensor_frame_num.get(sid_front, 0)
+    fn_r = _sensor_frame_num.get(sid_right, 0)
+    if not (fn_l and fn_f and fn_r and fn_l == fn_f == fn_r):
+        return False  # 未对齐（含非三目实验仅设了主相机的情形）→ 回退逐槽
+    now = time.time()
+    if fn_l == _triplet_last_fn and (now - _triplet_last_ts) < 2.0:
+        return True  # 同一批已推送且未超重发窗口
+    _triplet_last_fn = fn_l
+    _triplet_last_ts = now
+    for slot, sid in (("cameraL", sid_left), ("camera", sid_front), ("cameraR", sid_right)):
+        msg[slot] = {
+            "sensor_id": sid,
+            "base64": base64.b64encode(_sensor_frames[sid]).decode(),
+            "frame_num": fn_l,
+        }
+        _frame_slot_state[slot] = (fn_l, now)  # 同步逐槽去重状态，避免下轮回退时重复推送
+    return True
+
+
 def _sse_stream_thread():
     """后台线程：每 50ms 读取全局 _stream_vehicle/_stream_camera，推送给 SSE 订阅者"""
     while True:
@@ -255,18 +293,21 @@ def _sse_stream_thread():
                     }
                 else:
                     msg["vehicle"] = {"id": vid, "is_alive": False}
-            # 相机帧（主/前相机）
-            m = _frame_msg("camera", _stream_camera)
-            if m is not None:
-                msg["camera"] = m
-            # 左相机（三目实验）
-            m = _frame_msg("cameraL", _stream_camera_left)
-            if m is not None:
-                msg["cameraL"] = m
-            # 右相机（三目实验）
-            m = _frame_msg("cameraR", _stream_camera_right)
-            if m is not None:
-                msg["cameraR"] = m
+            # 三目相机（左/前/右）：帧号对齐时原子推送同批画面；
+            # 未对齐/非三目实验回退逐槽推送（保持原行为）
+            if not _frame_msg_triplet(msg):
+                # 相机帧（主/前相机）
+                m = _frame_msg("camera", _stream_camera)
+                if m is not None:
+                    msg["camera"] = m
+                # 左相机（三目实验）
+                m = _frame_msg("cameraL", _stream_camera_left)
+                if m is not None:
+                    msg["cameraL"] = m
+                # 右相机（三目实验）
+                m = _frame_msg("cameraR", _stream_camera_right)
+                if m is not None:
+                    msg["cameraR"] = m
             # 语义分割帧（独立于 RGB 相机流）
             m = _frame_msg("semantic", _stream_semantic)
             if m is not None:

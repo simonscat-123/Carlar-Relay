@@ -258,6 +258,9 @@ def _run_exp04(args):
         # --- 主循环 ---
         total_ticks = int(duration / fixed_delta)
         rows = []
+        # 实验起始基准：CARLA world 的 elapsed_seconds 是会话累计时间（含此前其他实验），
+        # 这里取主循环首个 tick 作为 t=0，后续全部转成相对本实验的相对时间
+        t0 = None
 
         _exp_log("准备就绪，开始采集数据…")
 
@@ -275,6 +278,9 @@ def _run_exp04(args):
             world.tick()
             snapshot = world.get_snapshot()
             t_sim = snapshot.timestamp.elapsed_seconds
+            if t0 is None:
+                t0 = t_sim  # 以首个 tick 为基准，保证相对时间从 0 开始
+            t_rel = t_sim - t0  # 相对本实验开始的时间
 
             count = latest_lidar["count"]
             dist = latest_lidar["dist"]
@@ -282,7 +288,7 @@ def _run_exp04(args):
 
             rows.append({
                 "frame": frame_num,
-                "time": t_sim,
+                "time": t_rel,
                 "front_point_count": count,
                 "nearest_front_obstacle_m": dist,
                 "total_points": latest_lidar.get("total", 0),
@@ -340,7 +346,7 @@ def _run_exp04(args):
                     "id": 4,
                     "trajectory": {
                         "frame": frame_num,
-                        "t": round(t_sim, 3),
+                        "t": round(t_rel, 3),
                         "plpr": plpr_value,
                         "front_point_count": count,
                         "nearest_front_obstacle_m": round(dist, 3) if not math.isinf(dist) else None,

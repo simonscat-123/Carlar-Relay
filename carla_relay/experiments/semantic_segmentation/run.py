@@ -7,17 +7,22 @@
 # 实验 5 · 可调参数区（文件头）
 #   天气退化参数集：每档天气对应一批数值，统一驱动各感知通路的退化程度
 #     det_sev   : 目标识别退化强度 [0,1] → 远处目标随机漏检概率、检测框抖动幅度
-#     sem_noise : 语义分割画面高斯噪声 σ（像素值，0=干净）→ 模拟真 RGB 分割器受扰
+#     sem_noise : 语义画面高斯噪声 σ（像素值，0=干净）→ 模拟真 RGB 分割器底噪
+#     sem_blur  : 语义画面距离模糊强度 [0,1] → 远区失焦/大气散射，越远越糊
+#     sem_fade  : 语义画面雾屏褪色强度 [0,1] → 远区向雾色靠拢，能见度下降
+#   这三者都按“距离权重 g”衰减：近处(≤d0)干净，超过 d1 完全退化。
 #   画面天气本体由 _exp5_weather 写入真实 CARLA 世界（set_weather），不再额外拟真。
 # =============================================================================
 _EXP5_WEATHER_PROFILE = {
-    "ClearNoon":    {"det_sev": 0.00, "sem_noise": 0.0},
-    "CloudyNoon":   {"det_sev": 0.12, "sem_noise": 3.0},
-    "SoftRainNoon": {"det_sev": 0.35, "sem_noise": 8.0},
-    "HardRainNoon": {"det_sev": 0.65, "sem_noise": 16.0},
-    "FoggyNoon":    {"det_sev": 0.70, "sem_noise": 12.0},
-    "ClearNight":   {"det_sev": 0.60, "sem_noise": 11.0},
+    "ClearNoon":    {"det_sev": 0.00, "sem_noise": 0.0, "sem_blur": 0.00, "sem_fade": 0.00},
+    "CloudyNoon":   {"det_sev": 0.12, "sem_noise": 3.0, "sem_blur": 0.15, "sem_fade": 0.15},
+    "SoftRainNoon": {"det_sev": 0.35, "sem_noise": 8.0, "sem_blur": 0.30, "sem_fade": 0.30},
+    "HardRainNoon": {"det_sev": 0.75, "sem_noise": 26.0, "sem_blur": 0.70, "sem_fade": 0.65},
+    "FoggyNoon":    {"det_sev": 0.80, "sem_noise": 22.0, "sem_blur": 0.85, "sem_fade": 0.85},
+    "ClearNight":   {"det_sev": 0.60, "sem_noise": 11.0, "sem_blur": 0.20, "sem_fade": 0.20},
 }
+# 距离退化曲线：(d0, d1) 米，逐像素 g=clip((D-d0)/(d1-d0), 0, 1)
+_EXP5_DIST_CURVE = {"d0": 2.0, "d1": 30.0}
 # =============================================================================
 # 实验 5: 视觉与语义分割
 # =============================================================================
@@ -107,18 +112,68 @@ def _exp5_jitter_box(targets, key, rng):
     return out
 
 
-def _exp5_sem_noise(rgb, key, rng):
-    """语义分割画面退化：按天气 sem_noise 叠加高斯噪声。
+def _exp5_depth_meters(depth_raw, h, w):
+    """深度相机 raw BGRA → 逐像素距离(米) float32。"""
+    arr = np.frombuffer(depth_raw, dtype=np.uint8).reshape((h, w, 4))
+    r = arr[:, :, 2].astype(np.float32)
+    g = arr[:, :, 1].astype(np.float32)
+    b = arr[:, :, 0].astype(np.float32)
+    return (r + g * 256.0 + b * 256.0 * 256.0) / (2.0 ** 24 - 1.0) * 1000.0
 
-    模拟『真实 RGB 语义分割器』在恶劣天下同样受扰（画面变花但结构仍在）。
-    rgb: (H,W,3) uint8；σ≤0 时原样返回。"""
+
+def _exp5_box_blur(img, r):
+    """可分离盒式模糊（前导零 cumsum 加速），r 为单向半径，输出尺寸与原输入一致。"""
+    out = img.astype(np.float32)
+    if r <= 0:
+        return out
+    n = 2 * r + 1
+    # 水平方向（axis=1）
+    p = np.pad(out, ((0, 0), (r, r), (0, 0)), mode="edge")     # (H, W+2r, 3)
+    z = np.zeros((p.shape[0], 1, p.shape[2]), dtype=np.float32)
+    c = np.cumsum(np.concatenate([z, p], axis=1), axis=1)      # (H, W+2r+1, 3)
+    out = (c[:, n:, :] - c[:, :-n, :]) / n                     # (H, W, 3)
+    # 垂直方向（axis=0）
+    p = np.pad(out, ((r, r), (0, 0), (0, 0)), mode="edge")     # (H+2r, W, 3)
+    z = np.zeros((1, p.shape[1], p.shape[2]), dtype=np.float32)
+    c = np.cumsum(np.concatenate([z, p], axis=0), axis=0)      # (H+2r+1, W, 3)
+    out = (c[n:, :, :] - c[:-n, :, :]) / n                     # (H, W, 3)
+    return out
+
+
+def _exp5_sem_degrade(rgb, key, depth_raw, h, w, sem_range):
+    """语义画面距离感知退化（真实 RGB 分割器在恶劣天下的弱视觉仿真）。
+
+    距离用深度相机真值逐像素映射：近处(≤d0)干净，越远退化越高，d1 以上完全退化。
+    滤镜（按文件头 sem_blur / sem_fade / sem_noise，均可为 0）：
+      1) 距离模糊   → 远区失焦/大气散射，越远越糊
+      2) 雾屏褪色   → 远区向雾色靠拢，能见度下降
+      3) 高斯噪声   → 远区更花（近处保留少量底噪）
+    深度无效(天空/远景)的像素视为最远（g=1）。"""
+    D = _exp5_depth_meters(depth_raw, h, w)
+    d0, d1 = _EXP5_DIST_CURVE["d0"], _EXP5_DIST_CURVE["d1"]
+    valid = (D > 0.05) & (D <= sem_range)
+    g = np.clip((D - d0) / (d1 - d0), 0.0, 1.0)
+    g = np.where(valid, g, 1.0)               # 天空/远景当成最退化
+
     prof = _exp5_weather_prof(key)
-    std = float(prof.get("sem_noise", 0.0))
-    if std <= 0.0 or rgb is None:
+    blur = float(prof.get("sem_blur", 0.0))
+    fade = float(prof.get("sem_fade", 0.0))
+    noise = float(prof.get("sem_noise", 0.0))
+    if blur <= 0.0 and fade <= 0.0 and noise <= 0.0:
         return rgb
-    # numpy 标准正态 × σ（random.Random 无 normal，用 gaussian 也没法整幅，故走 numpy）
-    n = (np.random.standard_normal(rgb.shape[:2] + (1,)).astype(np.float32) * std)
-    out = rgb.astype(np.float32) + n
+
+    out = rgb.astype(np.float32)
+    if blur > 0.0:
+        bmix = g * blur
+        blurred = _exp5_box_blur(out, 10)
+        out = out * (1.0 - bmix[..., None]) + blurred * bmix[..., None]
+    if fade > 0.0:
+        fog = g * fade
+        fogc = np.array([245.0, 248.0, 250.0], dtype=np.float32)
+        out = out * (1.0 - fog[..., None]) + fogc * fog[..., None]
+    if noise > 0.0:
+        std = noise * (0.3 + 0.7 * g)                 # 远区噪声更大
+        out += np.random.standard_normal(out.shape).astype(np.float32) * std[..., None]
     np.clip(out, 0.0, 255.0, out=out)
     return out.astype(np.uint8)
 
@@ -535,13 +590,19 @@ def _run_exp05(args):
         _exp_log("自动驾驶已启用，开始采集")
 
         total = int(duration / fixed_delta)
-        rows = []
+        # 实验相对时间：以首采集帧的 CARLA 世界时间为 0 起点，
+        # 避免把世界时钟（服务启动累计秒）误当成实验耗时
+        anchor_t = None
+        rel_t = 0.0
         for i in range(total):
             if _EXP05_ABORT:
                 break
             world.tick()
             snap = world.get_snapshot()
             t = snap.timestamp.elapsed_seconds
+            if anchor_t is None:
+                anchor_t = t
+            rel_t = t - anchor_t
 
             # 语义标签图（CityScapes）
             sem_labels = None
@@ -559,7 +620,6 @@ def _run_exp05(args):
             # ── 感知融合 → BEV 占据栅格世界 → 基于栅格的规划 ──
             targets = []
             bev_payload = None
-            grid_stat = None
             decision = None
             rich = {}   # 障碍 id -> 真实 actor 补齐的 pose/size/运动学
             if ins.id in _instance_raw and sem.id in _semantic_raw:
@@ -577,8 +637,8 @@ def _run_exp05(args):
                     # BEV 动态障碍统一口径：目标检测到（融合范围内）就绘制上 BEV，
                     # 只受 bev 栅格自身覆盖半径裁剪；不再受 depth_range 二次门控。
                     # 车道/可行驶等静态结构仍来自语义分割、受 semantic_range 截断。
-                    cells, grid_stat, bev_payload = bev.build(sem_labels, targets,
-                                                              sem_h=sh, sem_w=sw)
+                    cells, bev_payload = bev.build(sem_labels, targets,
+                                                   sem_h=sh, sem_w=sw)
                     decision = planner.decide(cells, res=bev.res)
                     # 前视 RGB：真实世界天气直接作用在该相机帧上 → 叠加抖动后的检测框。
                     # 画面即 CARLA 原图；识别几何仍以漏检后 targets 为准。
@@ -611,13 +671,15 @@ def _run_exp05(args):
                 except Exception:
                     pass
 
-            ratios = {}
             if sem_labels is not None:
                 labeled = _label_semantic_classes(sem_labels, classes, instance, world)
-                ratios = _ratios_from_labels(labeled, classes)
                 rgb = _colors_from_labels(labeled, classes)
-                # 语义画面退化：按天气 sem_noise 叠加随机噪声（程度不同天气不同）
-                rgb = _exp5_sem_noise(rgb, weather_key, weather_rng)
+                # 语义画面退化：按深度真值做距离感知退化（模糊/雾屏/噪声），近清远浊；
+                # 依赖与语义同位姿、同分辨率的深度图 → 距语义很近处干净，越远退化越高
+                if dep.id in _exp5_depth_raw:
+                    _sh5, _sw5 = sem_labels.shape
+                    rgb = _exp5_sem_degrade(rgb, weather_key, _exp5_depth_raw[dep.id],
+                                            _sh5, _sw5, sem_range)
                 # 语义画面按真实远近截断：用同位姿深度图置黑超出 semantic_range(含天空/远景)的像素
                 if dep.id in _exp5_depth_raw:
                     _sh5, _sw5 = sem_labels.shape
@@ -629,11 +691,9 @@ def _run_exp05(args):
                 _sensor_frames[sem.id] = buf.getvalue()
                 _sensor_frame_num[sem.id] = i + 1
 
-            rows.append({"frame": i + 1, "time": t, "classes": classes, **ratios})
             if i % 4 == 0:
-                pt = {"frame": i + 1, "t": round(t, 3), "progress": round((i + 1) / total * 100, 1), "classes": classes,
+                pt = {"frame": i + 1, "t": round(rel_t, 3), "progress": round((i + 1) / total * 100, 1), "classes": classes,
                       "weather": weather_key}
-                pt.update({k + "_ratio": v for k, v in ratios.items()})
                 pt["targets"] = len(targets)
                 _obs5 = []
                 for _k, _tg in enumerate(targets[:5]):
@@ -657,7 +717,6 @@ def _run_exp05(args):
                                       else None),
                     })
                 pt["obstacles"] = _obs5
-                pt["grid_stat"] = grid_stat
                 pt["bev"] = bev_payload
                 if classes == "22":
                     # 车道线仅在 22 类语义分割下绘制（7 类不产出 → BEV 无车道线）
@@ -674,8 +733,8 @@ def _run_exp05(args):
                     }
                 _push_to_sse({"experiment": {"id": 5, "trajectory": pt}})
 
-        _push_to_sse({"experiment": {"id": 5, "result": {"elapsed": round(t if rows else 0, 1), "rows": len(rows)}}})
-        _exp_log(f"实验5 完成 — {len(rows)} 行")
+        _push_to_sse({"experiment": {"id": 5, "result": {"elapsed": round(rel_t, 1), "frames": i + 1}}})
+        _exp_log(f"实验5 完成 — {i + 1} 帧")
     except Exception as e:
         _exp_log(f"实验5 错误: {e}")
     finally:

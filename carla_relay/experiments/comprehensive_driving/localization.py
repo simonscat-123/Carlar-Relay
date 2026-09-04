@@ -19,14 +19,23 @@ import carla
 
 from carla_relay.experiments.comprehensive_driving.frames import LocFrame
 
+# 噪声自适应 alpha 参数（文件头可调）：
+#   NOISE_JITTER          —— 每帧对 IMU/GNSS 噪声标准差施加的比例扰动（±10%），
+#                            使有效噪声逐帧波动，alpha 也随之每帧变化。
+#   ALPHA_MIN / ALPHA_MAX —— alpha 上下限钳制，避免极端 0/1（更信单传感器）导致抖动。
+#   ALPHA_IDLE            —— GNSS/INS 双噪声均≈0 时的中性回退值（此时比值无意义）。
+NOISE_JITTER = 0.10
+ALPHA_MIN = 0.05
+ALPHA_MAX = 0.95
+ALPHA_IDLE = 0.5
+
 
 class Localizer:
     """GNSS/INS 互补滤波定位器（有状态：INS 速度/位置递推 + 融合航向）。"""
 
-    def __init__(self, gnss_noise: float, ins_noise: float, alpha: float, init_loc):
+    def __init__(self, gnss_noise: float, ins_noise: float, init_loc):
         self.gnss_noise = gnss_noise
         self.ins_noise = ins_noise
-        self.alpha = alpha
         self.fused_loc = init_loc      # carla.Location，融合位置
         self.ins_vel = carla.Vector3D()
         self.fused_yaw_deg = 0.0       # 融合航向（度）
@@ -36,22 +45,33 @@ class Localizer:
              gps_failure: bool) -> LocFrame:
         """一帧融合。gt_loc/gt_yaw/true_vel 为真值（供观测合成与误差评估），
         gnss_ok 表示本帧 GNSS 观测是否可用（帧缓存里有无数据）。"""
+        # 噪声自适应 alpha：对 IMU/GNSS 噪声各施加 ±NOISE_JITTER 扰动（每帧波动），
+        # 再由有效噪声反向加权得到 GNSS 权重 alpha——噪声小的一方获得更高信任。
+        # fused = alpha*GNSS + (1-alpha)*INS，故有效 GNSS 噪声更小→alpha 越大越信 GNSS，
+        # 有效 INS 噪声更小→alpha 越小越信 INS。本帧 gauss 采样与融合均使用该有效噪声。
+        eff_gnss = self.gnss_noise * (1.0 + random.uniform(-NOISE_JITTER, NOISE_JITTER))
+        eff_ins = self.ins_noise * (1.0 + random.uniform(-NOISE_JITTER, NOISE_JITTER))
+        if eff_gnss + eff_ins < 1e-9:
+            alpha = ALPHA_IDLE
+        else:
+            alpha = max(ALPHA_MIN, min(ALPHA_MAX, eff_ins / (eff_gnss + eff_ins)))
+
         # GNSS 观测（带噪）：GPS 失效场景下 30% 帧完全丢星
         if gnss_ok and not (gps_failure and random.random() < 0.3):
-            noise = self.gnss_noise * (20.0 if gps_failure else 4.0)
+            noise = eff_gnss * (20.0 if gps_failure else 4.0)
             ngx = gt_loc.x + random.gauss(0, noise)
             ngy = gt_loc.y + random.gauss(0, noise)
         else:
-            ngx = gt_loc.x + random.gauss(0, self.gnss_noise * 10)
-            ngy = gt_loc.y + random.gauss(0, self.gnss_noise * 10)
+            ngx = gt_loc.x + random.gauss(0, eff_gnss * 10)
+            ngy = gt_loc.y + random.gauss(0, eff_gnss * 10)
 
         # INS 推算：以真值车速为基准叠加有界测量噪声（等效里程计/INS 误差）。
         # 速度加噪后限幅，防止个别异常帧把推算值拉飞
-        self.ins_vel.x = max(-60.0, min(60.0, true_vel.x + random.gauss(0, self.ins_noise * 8.0)))
-        self.ins_vel.y = max(-60.0, min(60.0, true_vel.y + random.gauss(0, self.ins_noise * 8.0)))
+        self.ins_vel.x = max(-60.0, min(60.0, true_vel.x + random.gauss(0, eff_ins * 8.0)))
+        self.ins_vel.y = max(-60.0, min(60.0, true_vel.y + random.gauss(0, eff_ins * 8.0)))
         ins_x = self.fused_loc.x + self.ins_vel.x * 0.05
         ins_y = self.fused_loc.y + self.ins_vel.y * 0.05
-        a = self.alpha * (0.1 if gps_failure else 1.0)
+        a = alpha * (0.1 if gps_failure else 1.0)
         self.fused_loc = carla.Location(
             x=a * ngx + (1 - a) * ins_x,
             y=a * ngy + (1 - a) * ins_y,
@@ -71,14 +91,14 @@ class Localizer:
             gyro_w = 0.0
             ins_yaw_deg = self.fused_yaw_deg
             gnss_yaw_deg = gt_yaw
-            yaw_a = self.alpha * (0.1 if gps_failure else 1.0)
+            yaw_a = alpha * (0.1 if gps_failure else 1.0)
         else:
             delta_deg = ((gt_yaw - self.prev_gt_yaw_deg + 180.0) % 360.0) - 180.0  # 本帧航向变化(度)
             self.prev_gt_yaw_deg = gt_yaw
-            gyro_w = delta_deg / 0.05 + random.gauss(0, self.ins_noise * 30.0)      # °/s
+            gyro_w = delta_deg / 0.05 + random.gauss(0, eff_ins * 30.0)      # °/s
             ins_yaw_deg = self.fused_yaw_deg + gyro_w * 0.05
-            gnss_yaw_deg = gt_yaw + random.gauss(0, self.gnss_noise * 4.0)          # 度
-            yaw_a = self.alpha * (0.1 if gps_failure else 1.0)
+            gnss_yaw_deg = gt_yaw + random.gauss(0, eff_gnss * 4.0)          # 度
+            yaw_a = alpha * (0.1 if gps_failure else 1.0)
             # 用「卷绕后的相位差(innovation)」做互补滤波：若直接对绝对角度求加权，
             # 在 ±180° 边界处会把 179.9° 与 -180.1° 平均成 -0.1°（实则同向），
             # 导致融合航向瞬间跳变，纯跟踪 cte 剧增、车辆跑偏（含 0 噪声场景）。
@@ -96,5 +116,6 @@ class Localizer:
             gnss_yaw_deg=gnss_yaw_deg,
             gyro_w=gyro_w,
             yaw_a=yaw_a,
+            alpha=alpha,
             loc_err=loc_err,
         )

@@ -15,7 +15,7 @@
   - 动态障碍来自融合感知目标（instance+semantic 投票 + 单目测距），占用足迹
     以目标估计半长/半宽覆盖栅格。
 
-输出：cells (G,G) int8 类别图 + 统计 stat + 前端渲染 payload（base64 紧凑编码）。
+输出：cells (G,G) int8 类别图 + 前端渲染 payload（base64 紧凑编码）。
 """
 from __future__ import annotations
 
@@ -43,7 +43,9 @@ def _project_pixels(mask_ys, mask_xs, fx, u0, v0, tilt_rad, cam_height):
     delta = np.arctan((v - v0) / fx)                       # 向下俯角
     theta = tilt_rad + delta                               # 相对水平面总俯角
     valid = theta > 0.02
-    d = np.where(valid, cam_height / np.tan(np.maximum(theta, 0.02)), np.inf)
+    # 无效像素用大有限哨兵(1e6 m)，避免 inf*0=NaN 污染 lat/fwd；
+    # 该距离远超任意栅格覆盖半径，填入时会被范围判断自然剔除
+    d = np.where(valid, cam_height / np.tan(np.maximum(theta, 0.02)), 1e6)
     psi = np.arctan2(u - u0, fx)                           # 水平方位角（右正，与综合驾驶一致）
     fwd = d * np.cos(psi)
     lat = d * np.sin(psi)
@@ -79,7 +81,7 @@ class BevBuilder:
 
     def build(self, sem_labels, targets, *, sem_h=None, sem_w=None):
         """sem_labels: (H,W) int32 CityScapes 标签；targets: fusion.perceive 结果。
-        返回 (cells (G,G) int8, stat dict, payload dict)。"""
+        返回 (cells (G,G) int8, payload dict)。"""
         G = self.G
         cells = np.full((G, G), UNK, dtype=np.int8)
         cells[G // 2, G // 2] = FREE                    # 自车位视为可行驶
@@ -120,9 +122,8 @@ class BevBuilder:
             if c0_e > c0_s and c1_e > c1_s:
                 cells[c0_s:c0_e, c1_s:c1_e] = cls
 
-        stat = self._stats(cells, len(targets))
-        payload = self._payload(cells, stat)
-        return cells, stat, payload
+        payload = self._payload(cells)
+        return cells, payload
 
     def _paint(self, cells, fwd, lat, cls):
         """把投影点批量标入栅格（越界/超出纵向范围丢弃）。"""
@@ -133,22 +134,10 @@ class BevBuilder:
         if m.any():
             cells[a0[m].astype(np.int64), a1[m].astype(np.int64)] = cls
 
-    def _stats(self, cells, n_targets):
-        total = cells.size
-        n_free = int(np.count_nonzero(cells == FREE))
-        n_occ = int(np.count_nonzero(np.isin(cells, (STATIC, VEH, WALK))))
-        return {
-            "free": n_free / total,
-            "occupied": n_occ / total,
-            "unknown": 1.0 - (n_free + n_occ) / total,
-            "targets": n_targets,
-        }
-
-    def _payload(self, cells, stat):
+    def _payload(self, cells):
         return {
             "res": self.res,
             "span": self.span,
             "w": self.G,
-            "stat": stat,
             "data": base64.b64encode(cells.tobytes()).decode(),
         }
