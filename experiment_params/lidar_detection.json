@@ -8,7 +8,7 @@
     "duration": 60,
     "range": 45,
     "channels": 64,
-    "points_per_second": 120000,
+    "points_per_second": 115200,
     "rotation_frequency": 20,
     "lidar_hfov": 360,
     "camera_fov": 90,
