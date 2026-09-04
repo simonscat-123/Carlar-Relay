@@ -302,6 +302,19 @@ def _exp5_depth_gray_jpeg(raw, h, w, max_range):
     return buf.getvalue()
 
 
+def _exp5_sem_truncate_by_depth(rgb, depth_raw, h, w, sem_range):
+    """按真实远近对语义画面截断：用与语义相机同位姿、同分辨率深度图的深度做真值，
+    深度 > sem_range 或深度无效(天空/远景/缺失)的像素置黑，语义感知范围外不再显示。
+    避免旧方案用地面平面逆投影(只依赖像素行)造成的"按上下截断"。"""
+    arr = np.frombuffer(depth_raw, dtype=np.uint8).reshape((h, w, 4))
+    r = arr[:, :, 2].astype(np.float32)
+    g = arr[:, :, 1].astype(np.float32)
+    b = arr[:, :, 0].astype(np.float32)
+    d = (r + g * 256.0 + b * 256.0 * 256.0) / (2.0 ** 24 - 1.0) * 1000.0
+    valid = (d > 0.05) & (d <= sem_range)
+    return np.where(valid[..., None], rgb, 0)
+
+
 _EXP05_RUNNING = False
 _EXP05_MISSED = set()  # 已诊断过的反查失败 actor id（避免每帧刷屏）
 _EXP05_VLOG = set()    # 已打印过原始速度的 actor id
@@ -409,6 +422,7 @@ def _run_exp05(args):
         sem_bp = world.get_blueprint_library().find("sensor.camera.semantic_segmentation")
         sem_bp.set_attribute("image_size_x", "800")
         sem_bp.set_attribute("image_size_y", "600")
+        sem_bp.set_attribute("fov", "90")
         sem = world.spawn_actor(sem_bp, carla.Transform(carla.Location(x=1.5, z=cam_height), carla.Rotation(pitch=cam_pitch)), attach_to=vehicle)
         actors.append(sem)
         _sensor_refs[sem.id] = sem
@@ -604,7 +618,11 @@ def _run_exp05(args):
                 rgb = _colors_from_labels(labeled, classes)
                 # 语义画面退化：按天气 sem_noise 叠加随机噪声（程度不同天气不同）
                 rgb = _exp5_sem_noise(rgb, weather_key, weather_rng)
-                # 语义画面整幅显示（不再按 semantic_range 距离置黑，避免远景/天空整片变黑）
+                # 语义画面按真实远近截断：用同位姿深度图置黑超出 semantic_range(含天空/远景)的像素
+                if dep.id in _exp5_depth_raw:
+                    _sh5, _sw5 = sem_labels.shape
+                    rgb = _exp5_sem_truncate_by_depth(rgb, _exp5_depth_raw[dep.id],
+                                                      _sh5, _sw5, sem_range)
                 img = PIL.Image.fromarray(rgb, mode="RGB")
                 buf = io.BytesIO()
                 img.save(buf, format="JPEG", quality=85)
