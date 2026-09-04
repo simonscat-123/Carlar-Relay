@@ -152,6 +152,14 @@ def _run_exp10(args):
     spawn_pedestrian = bool(args.get("spawn_pedestrian", False))
     sampling_res = float(args.get("sampling_resolution", 2.0))
 
+    # 全局路线规划算法与三类成本惩罚（缺省关闭惩罚，保持原始 A* 行为）
+    route_algorithm = str(args.get("algorithm", "astar")).lower()
+    if route_algorithm not in ("astar", "dijkstra", "bfs"):
+        route_algorithm = "astar"
+    lane_change_cost = float(args.get("lane_change_cost", 0.0))
+    intersection_cost = float(args.get("intersection_cost", 0.0))
+    curvature_gain = float(args.get("curvature_gain", 0.0))
+
     start_idx = int(args.get("start_spawn_idx", 0))
     end_idx = int(args.get("end_spawn_idx", 1))
     # 前端点选的起终点坐标（世界坐标），优先使用；未提供时回退到 spawn 索引
@@ -269,7 +277,27 @@ def _run_exp10(args):
         route_lane_ids = []       # 与 route_wp 平行：各路点所在车道 id（车道级避障判据用）
         try:
             from agents.navigation.global_route_planner import GlobalRoutePlanner
-            grp = GlobalRoutePlanner(carla_map, sampling_res)
+            # 自定义成本权重：仅当任一惩罚 >0 时启用，否则保持默认按边长度寻路
+            weight_fn = None
+            if lane_change_cost > 0 or intersection_cost > 0 or curvature_gain > 0:
+                import numpy as _np
+                from agents.navigation.local_planner import RoadOption
+                def _route_cost(_u, _v, edge):
+                    # 变道边的 add_edge 未携带 entry_vector/exit_vector（仅 exit_vector=None），
+                    # 需用 .get 防御性读取，否则换道时 KeyError
+                    c = edge.get('length', 0)
+                    if edge.get('type') in (RoadOption.CHANGELANELEFT, RoadOption.CHANGELANERIGHT):
+                        c += lane_change_cost          # 抑制变道
+                    if edge.get('intersection'):
+                        c += intersection_cost          # 抑制穿过路口
+                    ev, xv = edge.get('entry_vector'), edge.get('exit_vector')
+                    if ev is not None and xv is not None:
+                        cosn = _np.clip(_np.dot(ev, xv) / (_np.linalg.norm(ev) * _np.linalg.norm(xv)), -1, 1)
+                        c += curvature_gain * _np.arccos(cosn)   # 弯越急代价越高
+                    return c
+                weight_fn = _route_cost
+            _exp_log(f"全局路线算法={route_algorithm} 变道惩罚={lane_change_cost} 路口惩罚={intersection_cost} 弯道惩罚={curvature_gain}")
+            grp = GlobalRoutePlanner(carla_map, sampling_res, algorithm=route_algorithm, weight_fn=weight_fn)
             path = grp.trace_route(start_loc, end_loc)
             route_wp = [wp.transform.location for wp, _ in path]
             route_lane_ids = [(wp.road_id, wp.lane_id) for wp, _ in path]
@@ -675,7 +703,7 @@ def _run_exp10(args):
                                      avoid_margin=_avoid_margin)
             except Exception:
                 _gap_viz = None
-            _push_to_sse(build_sse_payload(
+            _payload = build_sse_payload(
                 t=t, wp_idx=wp_idx, route_wp=route_wp, route_lane_ids=route_lane_ids,
                 sampling_res=sampling_res, fused_loc=loc.fused_loc,
                 fused_yaw_deg=loc.fused_yaw_deg, spd=spd, desired=plan.desired,
@@ -685,7 +713,10 @@ def _run_exp10(args):
                 perceived_count=len(perc.perceived), gt_loc=gt_loc, gt_yaw=gt_yaw,
                 ngx=loc.ngx, ngy=loc.ngy, plan=plan, obs_list=perc.obs_list,
                 planned_obstacles=_EXP10_PLANNED_OBSTACLES, tl=tl, carla_map=carla_map,
-                viz3d=_viz3d, gap_viz=_gap_viz))
+                viz3d=_viz3d, gap_viz=_gap_viz)
+            # 调试：与 bbox3d/bird3d 同通道透出 2D 检测框归一化坐标，供前端对比屏幕坐标
+            _payload["bbox2d"] = _bbox_diag.get("uv2d", [])
+            _push_to_sse(_payload)
 
             # 同步模式下 tick 已按固定时间步推进并阻塞至该帧完成，无需额外 sleep
             # time.sleep(0.05)  # 20fps

@@ -2,6 +2,22 @@
 
 本文件由 carla_relay.experiments.load_into(globals()) 载入执行，不可独立 import。
 """
+
+# =============================================================================
+# 实验 5 · 可调参数区（文件头）
+#   天气退化参数集：每档天气对应一批数值，统一驱动各感知通路的退化程度
+#     det_sev   : 目标识别退化强度 [0,1] → 远处目标随机漏检概率、检测框抖动幅度
+#     sem_noise : 语义分割画面高斯噪声 σ（像素值，0=干净）→ 模拟真 RGB 分割器受扰
+#   画面天气本体由 _exp5_weather 写入真实 CARLA 世界（set_weather），不再额外拟真。
+# =============================================================================
+_EXP5_WEATHER_PROFILE = {
+    "ClearNoon":    {"det_sev": 0.00, "sem_noise": 0.0},
+    "CloudyNoon":   {"det_sev": 0.12, "sem_noise": 3.0},
+    "SoftRainNoon": {"det_sev": 0.35, "sem_noise": 8.0},
+    "HardRainNoon": {"det_sev": 0.65, "sem_noise": 16.0},
+    "FoggyNoon":    {"det_sev": 0.70, "sem_noise": 12.0},
+    "ClearNight":   {"det_sev": 0.60, "sem_noise": 11.0},
+}
 # =============================================================================
 # 实验 5: 视觉与语义分割
 # =============================================================================
@@ -14,6 +30,97 @@ from carla_relay.experiments.semantic_segmentation.grid_planner import GridPlann
 from carla_relay.experiments.comprehensive_driving.viz import render_perceived_frame as _exp5_render_perceived
 
 import math as _math5
+import random as _random5
+
+
+def _exp5_weather_prof(key):
+    """安全取天气预设；未知 key 按晴天处理。"""
+    return _EXP5_WEATHER_PROFILE.get(key, _EXP5_WEATHER_PROFILE["ClearNoon"])
+
+
+def _exp5_weather(key):
+    """按预设 key 返回真实 CARLA WeatherParameters；未知 key 返回 None。
+
+    优先使用 CARLA 内置天气预设常量（carla.WeatherParameters.*），并额外提供
+    自定义“大雾”预设。web 端下拉与本地 json 的 weather 字段都走本映射。"""
+    if not key:
+        return None
+    wp = getattr(carla.WeatherParameters, key, None)
+    if isinstance(wp, carla.WeatherParameters):
+        return wp
+    if key == "FoggyNoon":
+        return carla.WeatherParameters(
+            cloudiness=45.0, fog_density=85.0, fog_distance=10.0,
+            precipitation=0.0, precipitation_deposits=0.0, wetness=0.0,
+            sun_azimuth_angle=100.0, sun_altitude_angle=50.0,
+        )
+    return None
+
+
+def _exp5_apply_weather(world, key):
+    """把真实天气写入 CARLA 世界；入参为空或未知时返回 False。"""
+    wp = _exp5_weather(str(key or ""))
+    if wp is None:
+        return False
+    try:
+        world.set_weather(wp)
+        return True
+    except Exception as exc:
+        _exp_log(f"[weather] 设置天气 {key} 失败: {exc!r}")
+        return False
+
+
+def _exp5_degrade_detection(targets, key, rng):
+    """识别降级：按天气 det_sev，对较远目标随机漏检（近处基本保留）。
+
+    返回保留的目标列表；此处只做『丢』不动位置，保证 BEV/决策/障碍表一致
+    ——恶劣天看到的正是感知退化后的世界。"""
+    prof = _exp5_weather_prof(key)
+    sev = float(prof.get("det_sev", 0.0))
+    if sev <= 0.01:
+        return list(targets)
+    out = []
+    for t in targets:
+        d = t.get("dist", 40.0)
+        far = min(1.0, max(0.0, (d - 12.0) / 40.0))   # 12m 内基本保留，越远越易漏
+        drop = sev * (0.12 + 0.88 * far)
+        if rng.random() > drop:
+            out.append(t)
+    return out
+
+
+def _exp5_jitter_box(targets, key, rng):
+    """识别抖动：恶劣天按 det_sev 对检测框加少量随机像素偏移，呈现『识别不稳』。"""
+    prof = _exp5_weather_prof(key)
+    j = int(1 + 7 * float(prof.get("det_sev", 0.0)))
+    if j <= 0:
+        return list(targets)
+    out = []
+    for t in targets:
+        b = t.get("box")
+        if not b:
+            out.append(t)
+            continue
+        x0, y0, x1, y1 = b
+        jx, jy = rng.uniform(-j, j), rng.uniform(-j, j)
+        out.append({**t, "box": (x0 + jx, y0 + jy, x1 + jx, y1 + jy)})
+    return out
+
+
+def _exp5_sem_noise(rgb, key, rng):
+    """语义分割画面退化：按天气 sem_noise 叠加高斯噪声。
+
+    模拟『真实 RGB 语义分割器』在恶劣天下同样受扰（画面变花但结构仍在）。
+    rgb: (H,W,3) uint8；σ≤0 时原样返回。"""
+    prof = _exp5_weather_prof(key)
+    std = float(prof.get("sem_noise", 0.0))
+    if std <= 0.0 or rgb is None:
+        return rgb
+    # numpy 标准正态 × σ（random.Random 无 normal，用 gaussian 也没法整幅，故走 numpy）
+    n = (np.random.standard_normal(rgb.shape[:2] + (1,)).astype(np.float32) * std)
+    out = rgb.astype(np.float32) + n
+    np.clip(out, 0.0, 255.0, out=out)
+    return out.astype(np.uint8)
 
 
 def _exp5_lane_geoms(world, ego_tf, *, front=60.0, step=1.5, fov_deg=90.0):
@@ -228,6 +335,8 @@ def _run_exp05(args):
     bev_res = float(args.get("bev_res", 0.5))
     npc_count = int(args.get("npc_count", 0))
     walker_count = int(args.get("walker_count", 6))
+    weather_key = str(args.get("weather", "ClearNoon"))  # 天气拟真预设（画面+识别扰动）
+    weather_rng = _random5.Random()  # 每轮独立随机源：雨丝/漏检/抖动共用，现象更真实
 
     cam_fov = 90.0   # 语义/实例相机 FOV（度）
     cam_pitch = -5.0  # 相机安装俯仰（负值向下，供地面逆投影 / 单目测距）
@@ -249,6 +358,14 @@ def _run_exp05(args):
     _exp5_pos_hist = {}    # 障碍 id -> (gx, gy, t, cnt)，跨帧全局位移判静态
     try:
         world.apply_settings(carla.WorldSettings(synchronous_mode=True, fixed_delta_seconds=fixed_delta))
+        # 真实 CARLA 天气：写作世界后改变所有相机的真实光线；收尾还原原天气。
+        _exp5_orig_weather = None
+        try:
+            _exp5_orig_weather = world.get_weather()
+        except Exception:
+            _exp5_orig_weather = None
+        if _exp5_apply_weather(world, weather_key):
+            _exp_log(f"已应用真实世界天气: {weather_key}")
         tm = client.get_trafficmanager(8000)
         tm.set_synchronous_mode(True)
         # TM 全局调参：车距 / 车速差 / 混合物理（官方 generate_traffic 口径）
@@ -440,16 +557,22 @@ def _run_exp05(args):
                     targets = _exp5_perceive(inst_arr, sem_arr, cam_fov=cam_fov,
                                              cam_pitch=cam_pitch, cam_height=cam_height,
                                              perc_range=perc_range, exclude_ids=(vehicle.id,))
-                    # BEV 动态障碍足迹：目标识别距离 + 深度距离双重约束
-                    _tg_range = [t for t in targets if t["dist"] <= depth_range]
-                    cells, grid_stat, bev_payload = bev.build(sem_labels, _tg_range,
+                    # 天气 → 识别降级：恶劣天对远目标随机漏检（近处保留）。
+                    # 漏检后的 target 同步喂给 BEV/决策/障碍表 → 感知退化的世界是自洽的。
+                    targets = _exp5_degrade_detection(targets, weather_key, weather_rng)
+                    # BEV 动态障碍统一口径：目标检测到（融合范围内）就绘制上 BEV，
+                    # 只受 bev 栅格自身覆盖半径裁剪；不再受 depth_range 二次门控。
+                    # 车道/可行驶等静态结构仍来自语义分割、受 semantic_range 截断。
+                    cells, grid_stat, bev_payload = bev.build(sem_labels, targets,
                                                               sem_h=sh, sem_w=sw)
                     decision = planner.decide(cells, res=bev.res)
-                    # 前视 RGB 叠加检测框（复用综合驾驶 viz 渲染；失败不影响主流程）
+                    # 前视 RGB：真实世界天气直接作用在该相机帧上 → 叠加抖动后的检测框。
+                    # 画面即 CARLA 原图；识别几何仍以漏检后 targets 为准。
                     if cam.id in _exp5_rgb_raw:
                         rcw, rch = int(cam.attributes["image_size_x"]), int(cam.attributes["image_size_y"])
                         _rgb_arr = np.frombuffer(_exp5_rgb_raw[cam.id], dtype=np.uint8).reshape((rch, rcw, 4))
-                        _sensor_frames[cam.id] = _exp5_render_perceived(_rgb_arr, targets, iw, ih)
+                        _disp = _exp5_jitter_box(targets, weather_key, weather_rng)
+                        _sensor_frames[cam.id] = _exp5_render_perceived(_rgb_arr, _disp, iw, ih)
                         _sensor_frame_num[cam.id] = _sensor_frame_num.get(cam.id, 0) + 1
                 except Exception as _exp5e:
                     _exp_log(f"感知融合异常: {_exp5e!r}")
@@ -479,6 +602,8 @@ def _run_exp05(args):
                 labeled = _label_semantic_classes(sem_labels, classes, instance, world)
                 ratios = _ratios_from_labels(labeled, classes)
                 rgb = _colors_from_labels(labeled, classes)
+                # 语义画面退化：按天气 sem_noise 叠加随机噪声（程度不同天气不同）
+                rgb = _exp5_sem_noise(rgb, weather_key, weather_rng)
                 # 语义画面整幅显示（不再按 semantic_range 距离置黑，避免远景/天空整片变黑）
                 img = PIL.Image.fromarray(rgb, mode="RGB")
                 buf = io.BytesIO()
@@ -488,7 +613,8 @@ def _run_exp05(args):
 
             rows.append({"frame": i + 1, "time": t, "classes": classes, **ratios})
             if i % 4 == 0:
-                pt = {"frame": i + 1, "t": round(t, 3), "progress": round((i + 1) / total * 100, 1), "classes": classes}
+                pt = {"frame": i + 1, "t": round(t, 3), "progress": round((i + 1) / total * 100, 1), "classes": classes,
+                      "weather": weather_key}
                 pt.update({k + "_ratio": v for k, v in ratios.items()})
                 pt["targets"] = len(targets)
                 _obs5 = []
@@ -592,6 +718,12 @@ def _run_exp05(args):
             _instance_raw.pop(_a.id, None)
 
         _EXP05_RUNNING = False
+        # 还原实验前的真实世界天气，避免天气底色残留到后续实验
+        if _exp5_orig_weather is not None:
+            try:
+                world.set_weather(_exp5_orig_weather)
+            except Exception:
+                pass
         if _EXP05_ABORT:
             _push_to_sse({"experiment": {"id": 5, "status": "stopped"}})
 

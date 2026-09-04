@@ -13,6 +13,7 @@
     "bev_span": 60,
     "bev_res": 0.5,
     "npc_count": 20,
-    "walker_count": 6
+    "walker_count": 6,
+    "weather": "ClearNoon"
   }
 }

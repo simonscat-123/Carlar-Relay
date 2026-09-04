@@ -189,13 +189,39 @@ def route_plan():
     s = data.get("start", {})
     e = data.get("end", {})
     sampling = float(data.get("sampling_resolution", 2.0))
+    # 可配置的规划算法与三类成本惩罚（缺省关闭惩罚，保持原始 A* 行为）
+    algorithm = str(data.get("algorithm", "astar")).lower()
+    if algorithm not in ("astar", "dijkstra", "bfs"):
+        algorithm = "astar"
+    lane_change_cost = float(data.get("lane_change_cost", 0.0))
+    intersection_cost = float(data.get("intersection_cost", 0.0))
+    curvature_gain = float(data.get("curvature_gain", 0.0))
 
     start_loc = carla.Location(x=float(s.get("x", 0)), y=float(s.get("y", 0)), z=float(s.get("z", 0)))
     end_loc = carla.Location(x=float(e.get("x", 0)), y=float(e.get("y", 0)), z=float(e.get("z", 0)))
 
     try:
         from agents.navigation.global_route_planner import GlobalRoutePlanner
-        grp = GlobalRoutePlanner(world.get_map(), sampling)
+        # 自定义成本权重：仅当任一惩罚 >0 时启用，否则保持默认按边长度寻路
+        weight_fn = None
+        if lane_change_cost > 0 or intersection_cost > 0 or curvature_gain > 0:
+            import numpy as _np
+            from agents.navigation.local_planner import RoadOption
+            def _route_cost(_u, _v, edge):
+                # 变道边的 add_edge 未携带 entry_vector/exit_vector（仅 exit_vector=None），
+                # 需用 .get 防御性读取，否则换道时 KeyError
+                c = edge.get('length', 0)
+                if edge.get('type') in (RoadOption.CHANGELANELEFT, RoadOption.CHANGELANERIGHT):
+                    c += lane_change_cost          # 抑制变道
+                if edge.get('intersection'):
+                    c += intersection_cost          # 抑制穿过路口
+                ev, xv = edge.get('entry_vector'), edge.get('exit_vector')
+                if ev is not None and xv is not None:
+                    cosn = _np.clip(_np.dot(ev, xv) / (_np.linalg.norm(ev) * _np.linalg.norm(xv)), -1, 1)
+                    c += curvature_gain * _np.arccos(cosn)   # 弯越急代价越高
+                return c
+            weight_fn = _route_cost
+        grp = GlobalRoutePlanner(world.get_map(), sampling, algorithm=algorithm, weight_fn=weight_fn)
         path = grp.trace_route(start_loc, end_loc)
         waypoints = []
         total_len = 0.0

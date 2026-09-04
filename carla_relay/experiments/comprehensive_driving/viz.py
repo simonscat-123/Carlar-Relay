@@ -136,8 +136,17 @@ def render_bbox_overlay(inst, rgb_raw, instance_raw, perception_on, perceived,
             _rgb_arr = np.frombuffer(rgb_raw["raw"], dtype=np.uint8).reshape((rgb_raw["h"], rgb_raw["w"], 4))
             _ih = int(inst.attributes["image_size_y"])
             _iw = int(inst.attributes["image_size_x"])
+            # 调试：透出 2D 检测框的归一化坐标（相对 inst 帧，imgW/imgH 各是
+            # 该相机宽高；前端按与 3D segs 相同的 drawW/drawH 映射到画布，即可与
+            # 3D 虚线框屏幕坐标直接对比，用于定位"2D 对、3D 偏"的尺寸/基准错位）。
+            # 仅感知闭环感知到目标时下发；真值模式需实例解码，暂不提供（保持 []）。
+            diag["uv2d"] = []
             if perception_on:
                 out = render_perceived_frame(_rgb_arr, perceived, _iw, _ih)
+                diag["uv2d"] = [
+                    [p["box"][0] / _iw, p["box"][1] / _ih,
+                     p["box"][2] / _iw, p["box"][3] / _ih]
+                    for p in perceived if len(p.get("box", [])) == 4]
             else:
                 _inst_arr = np.frombuffer(instance_raw[inst.id], dtype=np.uint8).reshape((_ih, _iw, 4))
                 out = render_bbox_frame(_rgb_arr, _inst_arr, bbox_cands)
@@ -467,7 +476,9 @@ def overlay_3d_boxes(*, vehicle, fused_loc, fused_yaw_deg, obstacles, reference,
                                h_full, o_ground)
             add((255, 180, 0), pts, False, truth=True, foot=_ob[0],
                 obs_real=True)  # 障碍·真实（用真实顶点贴合）
-            add((255, 60, 60), _rect_from_verts(pts, am, o_ground), True)  # 障碍·带余量（真值中心）
+            _bot = _rect_from_verts(pts, am, o_ground)   # 余量框底边（真实中心+朝向）
+            _top = [carla.Location(b.x, b.y, b.z + h_full) for b in _bot]  # 顶边(补高度立体)
+            add((255, 60, 60), _bot + _top, True, foot=_bot)   # 障碍·带余量（真值中心，立体）
         else:
             o_ground = ground_z
             _bt = _obs_box_pts(reference, o, o["half_len"],
