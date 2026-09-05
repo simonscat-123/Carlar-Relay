@@ -269,7 +269,7 @@ class SimplePlanner:
         if red_stop_s is not None:
             s_stop = red_stop_s if s_stop == float("inf") else min(s_stop, red_stop_s)
 
-        # 速度/减速度导出（制动剖面 + 防蠕行，与 legacy 同型）
+        # 速度/减速度导出（制动剖面 + 防蠕行）
         if s_stop < float("inf"):
             d = max(0.1, s_stop - ego_s)
             if desired > 0:
@@ -407,14 +407,14 @@ class SimplePlanner:
                     front_obstacle = d_rear
                     front_obs_src = o["cls"]
 
-        # 黄灯软约束兜底——仅当感知层未提供黄灯停驻点时生效（perception_v2
-        # 红/黄统一输出停驻点，走上方常规停驻剖面；legacy 保留旧行为）
+        # 黄灯软约束兜底——仅当感知层未提供黄灯停驻点时生效（趋近停驻点时
+        # 施加缓制动）
         if (tl_state == "yellow" and red_stop_s is None
                 and a_need < 1.0):
             a_need = 1.0
             desired = min(desired, target_speed * 0.5)
 
-        # 逐帧一行调试日志（与 legacy FRM 行同位，便于 A/B 对比）
+        # 逐帧一行调试日志
         _obs_str = ",".join(f"{o['s']:.0f}/{o['l']:+.1f}" for o in obstacles[:3])
         # dec_win 越窗诊断：最近 blocker 后缘距 ego 的 s 余量；>dec_win 说明
         # 该 blocker 本应被 _blockers() 排除（跑的代码可能与注入的 dec_win 不一致）

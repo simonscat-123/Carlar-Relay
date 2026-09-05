@@ -418,7 +418,7 @@ def _run_exp05(args):
         except Exception:
             pass
         # 关闭 hybrid physics：该模式下 NPC 无真实物理，get_velocity() 恒为 0，
-        # 会让障碍物表格速度/加速度失真。改为完整物理模拟。
+        # 会让障碍物表格速度/加速度失真。使用完整物理模拟。
         try:
             tm.set_hybrid_physics_mode(False)
         except Exception:

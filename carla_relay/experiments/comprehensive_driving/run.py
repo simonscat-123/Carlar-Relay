@@ -103,13 +103,13 @@ def _run_exp10(args):
     bird_w = args.get("bird_w", 960)
     bird_h = args.get("bird_h", 960)
     bird_fov = args.get("bird_fov", 90.0)
-    # alpha 互补增益不再作为前端参数：改为由 IMU/GNSS 噪声自适应（噪声小的一方信任更高），
+    # alpha 互补增益由 IMU/GNSS 噪声自适应（噪声小的一方信任更高），
     # 每帧随噪声波动，见 localization.py 顶部 NOISE_JITTER/ALPHA_MIN/ALPHA_MAX/ALPHA_IDLE。
     _exp_log(f"本次参数: gnssσ={gnss_noise:.2f} insσ={ins_noise:.2f} "
              f"(alpha 自适应) "
              f"target={target_speed:.1f}m/s lookahead={lookahead:.1f}m kp={kp_steer:.2f}")
     # 感知闭环：开启后障碍物距离由 bbox 相机（实例+语义分割）单目估计，
-    # 不再查询世界真值；关闭则沿用真值扫描（两种模式可运行中实时切换对比）
+    # 关闭则使用世界真值。
     perception_mode = bool(args.get("perception", False))
     _exp_log(f"感知闭环: {'开（bbox 相机单目测距）' if perception_mode else '关（世界真值）'}")
     # 激进驾驶模式：必经车道被障碍堵死且无同向邻道可绕（单车道/邻接链断裂）时，
@@ -129,23 +129,22 @@ def _run_exp10(args):
             "perception": 1.0 if perception_mode else 0.0,
             "aggressive": 1.0 if aggressive_mode else 0.0,
         })
-    # 规划器选择：simple=单一几何避障（方案B，构造性生成+地图级校验）；
-    # legacy=采样式时空联合规划（默认，保持旧行为）
+    # 规划器选择：simple=单一几何避障（构造性生成+地图级校验）；
+    # legacy=采样式时空联合规划（默认）
     planner_kind = str(args.get("planner", "legacy")).lower()
     if planner_kind not in ("simple", "legacy"):
         planner_kind = "legacy"
     _exp_log(f"规划器: {planner_kind}"
              f"{'（单一几何避障）' if planner_kind == 'simple' else '（FSM+采样式规划）'}")
     # 控制器选择：v2=前馈+反馈纵向（无油门基线，停车保持归控制层）；
-    # legacy=0.25 基线油门 + 纯前馈制动（保持旧行为，默认）
+    # legacy=0.25 基线油门 + 纯前馈制动（默认）
     controller_kind = str(args.get("controller", "legacy")).lower()
     if controller_kind not in ("v2", "legacy"):
         controller_kind = "legacy"
     _exp_log(f"控制器: {controller_kind}"
              f"{'（前馈+反馈纵向）' if controller_kind == 'v2' else '（基线油门+前馈制动）'}")
     # 感知器（信号灯判定）选择：v2=车道归属+路口committed+越线判定，红/黄
-    # 统一停驻点（修：黄灯不停/红灯蠕行闯灯/停在路中间等驶入车道的灯）；
-    # legacy=旧判定（保持旧行为，默认）
+    # 统一停驻点；legacy=基础信号灯判定（默认）
     perceiver_kind = str(args.get("perceiver", "legacy")).lower()
     if perceiver_kind not in ("v2", "legacy"):
         perceiver_kind = "legacy"
@@ -155,7 +154,7 @@ def _run_exp10(args):
     tl_stop_margin = float(args.get("tl_stop_margin", RED_MARGIN))
     tl_brake_window = float(args.get("tl_brake_window", 80.0))
     # 规划/感知可调参数（JSON 覆盖，缺省按各消费层模块头登记默认；构造时注入 params：
-    # simple_planner 避障窗 dec_win=25；legacy 规划器决策窗 dec_win=60；感知距离=50）
+    # simple_planner 避障窗 dec_win=25；默认规划器决策窗 dec_win=60；感知距离=50）
     exp_params = {
         "dec_win": float(args.get("dec_win",
                                   25.0 if planner_kind == "simple" else 60.0)),
@@ -446,7 +445,7 @@ def _run_exp10(args):
             planner = TrajectoryPlanner(reference, predictor, _exp_log, _plan_log,
                                         ego_half_w, ego_half_len, params=exp_params)
         # 越障横向余量（JSON: avoid_margin 可覆盖）：simple 规划器从注入的
-        # exp_params 读取；legacy 规划器无该量 → 回退模块默认，用于可视化同源。
+        # exp_params 读取；默认规划器无该量 → 回退模块默认，用于可视化同源。
         _avoid_margin = getattr(planner, "avoid_margin", AVOID_MARGIN)
         if controller_kind == "v2":
             controller = VehicleControllerV2(kp_steer, lookahead, steer_delay,
@@ -736,7 +735,7 @@ def _run_exp10(args):
                 ngx=loc.ngx, ngy=loc.ngy, plan=plan, obs_list=perc.obs_list,
                 planned_obstacles=_EXP10_PLANNED_OBSTACLES, tl=tl, carla_map=carla_map,
                 viz3d=_viz3d, gap_viz=_gap_viz)
-            # 调试：与 bbox3d/bird3d 同通道透出 2D 检测框归一化坐标，供前端对比屏幕坐标
+            # 与 bbox3d/bird3d 同通道透出 2D 检测框归一化坐标，供前端校准屏幕坐标
             _payload["bbox2d"] = _bbox_diag.get("uv2d", [])
             # 透出当前帧自适应 alpha（GNSS 权重）供状态栏动态展示
             _payload["alpha"] = round(loc.alpha, 3)
@@ -872,8 +871,7 @@ def _run_exp10(args):
             # 但未被上面各分支显式销毁的），并同步 discard 出登记表。
             # 若不在此收尾，这些 actor id 会泄漏到下次运行，被 _sweep_stale_actors
             # 对已销毁 actor 重复 destroy，触发 CARLA libcarla 原生 Abort（run2+ 崩溃）。
-            # ——但路线绑定障碍物例外：未重新规划时保留在世界中（跨运行沿用），
-            #   便于「停止→调参→再运行」对比自动驾驶参数影响时场景保持一致。
+            # ——但路线绑定障碍物例外：未重新规划时保留在世界中，供下次运行沿用。
             _keep_ids = {ent["id"] for ent in _EXP10_OBSTACLE_ACTORS}
             with _lock:
                 _leftover = [aid for aid in _managed_actors if aid not in _keep_ids]
@@ -986,7 +984,7 @@ def experiment_10_params():
         for key in ("kp_steer", "lookahead", "target_speed", "steer_delay", "brake_force"):
             if key in data and data[key] is not None:
                 _EXP10_CTRL[key] = float(data[key])
-        # 感知闭环开关：运行中实时切换「bbox 相机感知 / 世界真值」，便于 A/B 对比
+        # 感知闭环开关：运行中实时切换「bbox 相机感知 / 世界真值」
         if "perception" in data and data["perception"] is not None:
             _EXP10_CTRL["perception"] = 1.0 if bool(data["perception"]) else 0.0
         # 激进驾驶开关：运行中实时切换「安全模式 / 借对向道绕障」

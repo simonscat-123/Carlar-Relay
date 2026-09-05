@@ -83,7 +83,7 @@ def _bootstrap_relay_path(carla_root: Optional[str] = None) -> str:
     candidates += _glob.glob(                   # 官方做法：dist 下 carla-*.egg 直接加载
         os.path.join(pyapi, "dist", "carla-*.egg")
     )
-    # 兼容脚本被放置/复制的其它位置（多为 CARLA 根目录内的副本）
+    # 追加候选路径：本文件所在目录的上级及当前目录下的 PythonAPI
     for base in (
         os.path.dirname(os.path.abspath(__file__)),
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -101,10 +101,9 @@ def _bootstrap_relay_path(carla_root: Optional[str] = None) -> str:
 _CARLA_ROOT = _bootstrap_relay_path()
 
 # ---------------------------------------------------------------------------
-# 注入 server/ 包目录，使本文件可 import carla_relay 新包。
-# 引导壳已随核心逻辑一起移入 server/ 目录，默认包目录即本文件所在目录；
-# 若由 public/carla_relay.py 启动器拉取旧副本到 public/ 下运行，则回退到
-# 上一级 server/ 目录（兼容旧部署路径）。
+# 注入 server/ 包目录，使本文件可 import carla_relay 包。
+# 默认包目录即本文件所在目录；若该目录下不存在 carla_relay 包，
+# 则回退到上一级 server/ 目录查找。
 # ---------------------------------------------------------------------------
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _SERVER_PKG_DIR = _HERE
@@ -135,9 +134,9 @@ def _cors(response):
 
 
 # ---------------------------------------------------------------------------
-# P3 迁移：基础路由（health/sync/vehicle/sensors/stream/preview/misc）已抽取至
-# carla_relay.routes 蓝图包，URL 与响应格式零变更。蓝图经 app.extensions["legacy"]
-# 在请求期动态访问本模块全局（world / 帧缓存 / stream 目标等）。
+# 注册基础路由蓝图（health/sync/vehicle/sensors/stream/preview/misc）。
+# 蓝图经 app.extensions["legacy"] 在请求期动态访问本模块全局（world / 帧缓存
+# / stream 目标等）。
 # ---------------------------------------------------------------------------
 import carla_relay.routes as _routes_pkg
 
@@ -166,15 +165,15 @@ _instance_raw: Dict[int, bytes] = {}  # instance sensor_id -> 原始 BGRA raw（
 # 旧版同步设置（用于恢复）
 _old_settings: Any = None
 
-# SSE 订阅者队列已抽取至 carla_relay.core.sse（P2）：订阅者管理与广播由 hub 承载
+# SSE 订阅者队列与广播由 carla_relay.core.sse.hub 承载
 # =============================================================================
-# 以下配置/感知/核心逻辑已抽取至 server/carla_relay 包（P1-P2 绞杀者迁移）：
+# 以下配置/感知/核心逻辑由 server/carla_relay 包提供：
 #   - carla_relay.config: 语义类别表 / 类别预设映射 / 帧间隔常量
 #   - carla_relay.perception.semantics: 语义类别映射纯函数
 #   - carla_relay.core.sse: SSE 订阅者 hub
 #   - carla_relay.core.sensors: 传感器帧序列化
 #   - carla_relay.core.carla_client: CARLA 连接与进程管理
-# 此处以别名导入保持本文件内部引用不变（行为零变更）。
+# 此处以别名导入保持本文件内部引用不变。
 # =============================================================================
 from carla_relay.config import (
     FRAME_INTERVAL,
@@ -195,7 +194,7 @@ import carla_relay.core.carla_client as _carla_client
 
 
 def _push_to_sse(msg: dict):
-    """向所有 SSE 订阅者推送消息（P2 已抽取至 carla_relay.core.sse.hub）"""
+    """向所有 SSE 订阅者推送消息"""
     _sse_hub.push(msg)
 
 
@@ -234,7 +233,7 @@ def _frame_msg_triplet(msg: dict) -> bool:
 
     与 _frame_msg 相同的 2s 重发窗口：同一批帧 2s 内不重复推送，
     超过 2s 重发一次保证新订阅/重连客户端能拿到当前画面。
-    任一路未就绪或帧号未对齐时返回 False，调用方回退逐槽推送（保持原行为）。
+    任一路未就绪或帧号未对齐时返回 False，调用方回退逐槽推送。
     """
     global _triplet_last_fn, _triplet_last_ts
     sid_left, sid_front, sid_right = _stream_camera_left, _stream_camera, _stream_camera_right
@@ -301,7 +300,7 @@ def _sse_stream_thread():
                 finally:
                     _stream_io_guard.release()
             # 三目相机（左/前/右）：帧号对齐时原子推送同批画面；
-            # 未对齐/非三目实验回退逐槽推送（保持原行为）
+            # 未对齐/非三目实验回退逐槽推送
             if not _frame_msg_triplet(msg):
                 # 相机帧（主/前相机）
                 m = _frame_msg("camera", _stream_camera)
@@ -364,7 +363,7 @@ def _sse_stream_thread():
 
 
 def _init_carla(carla_host: str, carla_port: int, auto_manage: bool = True) -> None:
-    """连接 CARLA（P2 已抽取至 carla_relay.core.carla_client.connect）并写入全局状态"""
+    """连接 CARLA 并写入全局状态"""
     global world, client, traffic_manager
     client, world, traffic_manager = _carla_client.connect(
         carla_host, carla_port, auto_manage=auto_manage,
@@ -374,11 +373,11 @@ def _init_carla(carla_host: str, carla_port: int, auto_manage: bool = True) -> N
 
 
 # =============================================================================
-# API: 健康检查 / 地图信息 / 同步模式 —— P3 已迁移至 carla_relay.routes（health.py / sync.py）
+# API: 健康检查 / 地图信息 / 同步模式 —— 由 carla_relay.routes 提供（health.py / sync.py）
 # =============================================================================
 
 # =============================================================================
-# API: 车辆生成/销毁/控制/自动驾驶/视角 —— P3 已迁移至 carla_relay.routes（vehicle.py）
+# API: 车辆生成/销毁/控制/自动驾驶/视角 —— 由 carla_relay.routes 提供（vehicle.py）
 # =============================================================================
 
 # =============================================================================
@@ -386,7 +385,7 @@ def _init_carla(carla_host: str, carla_port: int, auto_manage: bool = True) -> N
 # =============================================================================
 
 def _sensor_callback(sid: int, dtype: str, data: Any):
-    """传感器回调：序列化（P2 已抽取至 carla_relay.core.sensors）并写入全局帧缓存"""
+    """传感器回调：序列化并写入全局帧缓存"""
     try:
         payload, fnum = _serialize_sensor_frame(dtype, data)
         if dtype == "semantic":
@@ -406,7 +405,7 @@ def _sensor_callback(sid: int, dtype: str, data: Any):
         print(f"[WARN] 传感器回调失败 dtype={dtype} sid={sid}: {exc}")
 
 
-# 传感器挂载 / 帧查询 / 删除路由 —— P3 已迁移至 carla_relay.routes（sensors.py）
+# 传感器挂载 / 帧查询 / 删除路由 —— 由 carla_relay.routes 提供（sensors.py）
 
 # =============================================================================
 # API: SSE 实时数据流
@@ -439,21 +438,20 @@ def _start_stream_thread():
     _stream_thread.start()
 
 
-# stream / preview / debug / actors / cleanup 路由 —— P3 已迁移至
-# carla_relay.routes（stream.py / misc.py）。SSE 线程 _sse_stream_thread 与
+# stream / preview / debug / actors / cleanup 路由 —— 由
+# carla_relay.routes 提供（stream.py / misc.py）。SSE 线程 _sse_stream_thread 与
 # stream 目标全局仍在本文件，蓝图经 app.extensions["legacy"] 动态读写。
 
 
 # ---------------------------------------------------------------------------
-# P4 迁移：实验逻辑与世界 API 已物理拆分至 carla_relay 包（绞杀者迁移）：
+# 加载实验逻辑与世界 API 片段至本模块命名空间：
 #   - carla_relay.experiments: 定位分析(localization) / Lidar检测(lidar_detection) /
 #     语义分割(semantic_segmentation) + 历史实验 + 共享状态 + 控制器；
 #     综合驾驶(comprehensive_driving) 单独经 load_comprehensive_driving_into 载入
 #   - carla_relay.world_api:   感知查询 / 路径规划 / 地图 / 行人 / 俯瞰 API
-# 片段经 load_into(globals()) 载入本模块命名空间执行：代码原样迁移，
-# __file__ / global 重绑定 / @app.route 注册语义不变，行为零漂移。
-# 加载顺序与原文件模块级语句执行顺序完全一致：
-# 其余实验 → 世界API → 综合驾驶。URL 中的数字实验 ID 为 API 契约，不变。
+# 片段经 load_into(globals()) 载入本模块命名空间执行，保持 __file__ / global
+# 重绑定 / @app.route 注册语义一致。加载顺序：其余实验 → 世界API → 综合驾驶。
+# 数字实验 ID 为 API 契约，保持不变。
 # ---------------------------------------------------------------------------
 from carla_relay.experiments import load_into as _load_experiment_fragments
 from carla_relay.experiments import load_comprehensive_driving_into as _load_comprehensive_driving_fragments
@@ -464,8 +462,8 @@ _load_world_api_fragments(globals())
 _load_comprehensive_driving_fragments(globals())
 
 # =============================================================================
-# 综合驾驶（闭环自动驾驶，API 实验ID 10）→ P4 已迁移至
-# carla_relay/experiments/comprehensive_driving/（分层真实模块 + run.py 薄编排片段）
+# 综合驾驶（闭环自动驾驶，API 实验ID 10）→ 由
+# carla_relay/experiments/comprehensive_driving/ 提供（分层真实模块 + run.py 编排片段）
 # =============================================================================
 
 
@@ -497,8 +495,7 @@ def _setup_static(static_dir: Path):
 # =============================================================================
 
 
-# CARLA 进程管理（P2 已抽取至 carla_relay.core.carla_client）：
-# 此处保留别名，供本文件内部调用点（main 等）零改动。
+# CARLA 进程管理别名（供本文件内部调用点使用）
 _kill_other_relays = _carla_client.kill_other_relays
 _find_carla_executable = _carla_client.find_carla_executable
 _list_carla_pids = _carla_client.list_carla_pids
