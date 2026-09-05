@@ -87,8 +87,12 @@ class SensorRig:
         # 前相机原始 BGRA 帧缓存：包围框渲染需要未编码帧
         self.rgb_raw = {"raw": None, "w": 1280, "h": 720}
 
-    def spawn(self, world, vehicle, push):
-        """挂载全套传感器，返回 (cam, inst, sem, bird, lidar, gnss, imu, col)。"""
+    def spawn(self, world, vehicle, push, *, bird_w=960, bird_h=960, bird_fov=90):
+        """挂载全套传感器，返回 (cam, inst, sem, bird, lidar, gnss, imu, col)。
+
+        bird_w/bird_h/bird_fov：鸟瞰相机分辨率与 FOV，由实验 JSON/前端传入，
+        仅启动时生效（不参与运行中热调）。分辨率做非法值防护后应用。
+        """
         self.collision._push = push
         log = self._log
 
@@ -128,11 +132,21 @@ class SensorRig:
         sem.listen(lambda d, sid=sem.id: self._sensor_callback(sid, "semantic", d))
         self._register(sem)
 
-        # 高空俯视相机（跟随车辆，真实渲染俯瞰画面）
+        # 高空俯视相机（跟随车辆，真实渲染俯瞰画面）。
+        # 分辨率由实验 JSON/前端参数控制；防非法值（限宽高范围）后设置。
+        try:
+            bird_w = int(bird_w)
+            bird_h = int(bird_h)
+        except Exception:
+            bird_w, bird_h = 960, 960
+        bird_w = min(max(bird_w, 320), 1920)
+        bird_h = min(max(bird_h, 320), 1920)
+        bird_fov = float(bird_fov) if not isinstance(bird_fov, bool) else 90.0
+        bird_fov = min(max(bird_fov, 30.0), 120.0)
         bird_bp = world.get_blueprint_library().find("sensor.camera.rgb")
-        bird_bp.set_attribute("image_size_x", "960")
-        bird_bp.set_attribute("image_size_y", "960")
-        bird_bp.set_attribute("fov", "90")
+        bird_bp.set_attribute("image_size_x", str(bird_w))
+        bird_bp.set_attribute("image_size_y", str(bird_h))
+        bird_bp.set_attribute("fov", str(bird_fov))
         bird = world.spawn_actor(
             bird_bp,
             carla.Transform(carla.Location(z=45), carla.Rotation(pitch=-90, yaw=0, roll=0)),

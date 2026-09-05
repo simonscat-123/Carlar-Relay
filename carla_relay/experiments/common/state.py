@@ -74,7 +74,7 @@ def _any_experiment_running():
     ])
 
 
-def _sweep_stale_actors(owner_label="experiment"):
+def _sweep_stale_actors(owner_label="experiment", preserve_ids=()):
     """实验线程体开头调用：销毁上一实验残留的托管 actor，保证干净起点。
 
     背景：实验异常收尾（中途停止时 CARLA 短暂无响应等）可能泄漏车辆/传感器，
@@ -82,9 +82,13 @@ def _sweep_stale_actors(owner_label="experiment"):
     残留 GNSS/IMU 还会持续回调浪费带宽。start handler 已保证旧线程退出后才
     放行新实验，故此处扫到的存活 actor 必为泄漏物，可安全销毁。
     返回销毁数量。
+
+    preserve_ids：需要跨运行保留的 actor id 集合（如综合驾驶实验的路线绑定障碍物）。
+    未重新规划时沿用旧障碍，这些 actor 不销毁、不出管理表，供下轮运行复用。
     """
+    keep = set(preserve_ids)
     with _lock:
-        stale_ids = list(_managed_actors)
+        stale_ids = [aid for aid in _managed_actors if aid not in keep]
     destroyed = 0
     for aid in stale_ids:
         try:

@@ -23,18 +23,8 @@ HUD_TEXT = (215, 225, 245)
 HUD_DIM = (140, 152, 176)
 OK_COLOR = (120, 220, 150)
 
-# ── 鸟瞰叠加开关（每题一项；False 即不画对应元素，改这里即可）──
-VIZ_LANE_BAND = True    # 车道底色带（当前/目标/规划车道半透明带）
-VIZ_LANE_EDGE = True    # 车道边界线（实线/虚线）
-VIZ_REF_LINE = True     # 参考路线（蓝实线）
-VIZ_PRED_LINE = True    # 预测轨迹（橙虚线）
-VIZ_OBSTACLE = False     # 障碍物块（红）
-VIZ_RANGE = False        # 感知范围圈（约 50m）
-VIZ_EGO_MARK = False     # 自车标记（中心圆点）
-VIZ_BBOX3D = True       # 3D 包围框（自车真实+纯车宽参考虚线；障碍真实+余量虚线）
-VIZ_GAP_BAND = True     # 障碍两侧车身可容空间带（绿=带宽≥车宽/红=不够）+ 可容宽标注
-VIZ_EDGE_MARGIN = True  # 可容带外侧 EDGE 边界余量保留区（黄带 + 余量标注）
-VIZ_EGO_CLEAR = True    # 自车所需通过宽度标注（车宽 X.Xm）
+# ── 鸟瞰叠加已由后端烧录进画面，本地不再有鸟瞰叠加开关 ──────────────
+VIZ_BBOX3D = True        # 右侧前置相机 3D 包围框（保留前端 overlay 通道）
 
 # 帧缓存：slot -> (b64, surface)，避免同一帧重复 JPEG 解码
 _FRAME_CACHE: dict = {}
@@ -580,208 +570,8 @@ def render_semantic(screen, fonts, surfaces, exp, hist: TelemetryHistory, ctx):
 # ═══════════════════════════════════════════════════════════════════
 # 实验 10 综合驾驶：鸟瞰叠加 + 包围框 + 图表
 # ═══════════════════════════════════════════════════════════════════
-_LANE_BBOX_CACHE = {"lanes": None, "bbox": []}
-
-
-def _lane_bboxes(lanes):
-    if _LANE_BBOX_CACHE["lanes"] is lanes:
-        return _LANE_BBOX_CACHE["bbox"]
-    bbs = []
-    for lane in lanes:
-        pts = lane.get("pts", [])
-        if not pts:
-            bbs.append(None)
-            continue
-        xs = [p["x"] for p in pts]
-        ys = [p["y"] for p in pts]
-        bbs.append((min(xs), min(ys), max(xs), max(ys)))
-    _LANE_BBOX_CACHE["lanes"] = lanes
-    _LANE_BBOX_CACHE["bbox"] = bbs
-    return bbs
-
-
-def _draw_bird_overlay(screen, rect, exp, lanes, font=None):
-    """在鸟瞰相机画面上叠加车道 / 参考线 / 预测线 / 障碍物（对齐前端 drawLaneBev）。
-
-    鸟瞰相机：960×960、FOV 90°、挂车顶 z=45 正下视 → 图像中心是自车，
-    K = 480/45 px/m；画面随车旋转（挂接车辆），用真值航向对齐世界系。
-    """
-    pos = exp.get("gt") or exp.get("fused")
-    if not pos or not lanes:
-        return
-    pw, ph = rect[2], rect[3]
-    s = min(pw, ph) / 960.0
-    ox = rect[0] + (pw - 960 * s) / 2
-    oy = rect[1] + (ph - 960 * s) / 2
-    K = 480.0 / 45.0
-    hr = math.radians(exp.get("gt_yaw", exp.get("heading", 0.0)) or 0.0)
-    fx, fy = math.cos(hr), math.sin(hr)
-    rx, ry = -math.sin(hr), math.cos(hr)
-
-    def to_scr(x, y):
-        dx, dy = x - pos["x"], y - pos["y"]
-        fr = dx * fx + dy * fy      # 前向分量 → 图像上方
-        rr = dx * rx + dy * ry      # 右向分量 → 图像右侧
-        return (ox + (480 + K * rr) * s, oy + (480 - K * fr) * s)
-
-    cx, cy = ox + 480 * s, oy + 480 * s
-    # 半透明叠加层（车道底色带）
-    overlay = pygame.Surface((rect[2], rect[3]), pygame.SRCALPHA)
-
-    def band_poly(lane, hw):
-        pts = lane.get("pts", [])
-        if len(pts) < 2:
-            return None
-        left, right = [], []
-        for k, a in enumerate(pts):
-            b = pts[min(k + 1, len(pts) - 1)]
-            c = pts[max(k - 1, 0)]
-            tx, ty = b["x"] - c["x"], b["y"] - c["y"]
-            tl = math.hypot(tx, ty) or 1.0
-            tx, ty = tx / tl, ty / tl
-            nx, ny = -ty, tx
-            left.append(to_scr(a["x"] + nx * hw, a["y"] + ny * hw))
-            right.append(to_scr(a["x"] - nx * hw, a["y"] - ny * hw))
-        return left + right[::-1]
-
-    def draw_band(key, rgba, stroke_rgba):
-        if not key:
-            return
-        bbs = _lane_bboxes(lanes)
-        for i, lane in enumerate(lanes):
-            if lane.get("road") != key[0] or lane.get("lane") != key[1]:
-                continue
-            bb = bbs[i]
-            if bb is None:
-                continue
-            # 只画自车 60m 内的车道
-            dx = max(bb[0] - pos["x"], 0, pos["x"] - bb[2])
-            dy = max(bb[1] - pos["y"], 0, pos["y"] - bb[3])
-            if dx * dx + dy * dy > 60 * 60:
-                continue
-            hw = (lane.get("width") or 3.5) / 2
-            poly = band_poly(lane, hw)
-            if poly and len(poly) >= 3:
-                pygame.draw.polygon(overlay, rgba, poly)
-                pygame.draw.polygon(overlay, stroke_rgba, poly, 1)
-
-    lane_info = exp.get("lane") or {}
-    cur, tgt = lane_info.get("cur"), lane_info.get("tgt")
-    if VIZ_LANE_BAND:
-        for pl in (lane_info.get("plan") or []):
-            key = pl.get("lane") if isinstance(pl, dict) else None
-            if key and key != cur and key != tgt:
-                fade = max(0.25, 1 - (pl.get("dist", 0) or 0) / 60)
-                draw_band(key, (54, 89, 255, int(36 * fade)), (54, 89, 255, int(100 * fade)))
-        if cur:
-            draw_band(cur, (54, 89, 255, 55), (54, 89, 255, 150))
-        if tgt and tgt != cur:
-            draw_band(tgt, (0, 180, 42, 60), (0, 180, 42, 190))
-    screen.blit(overlay, (rect[0], rect[1]))
-
-    # 车道边界线（实线 / 虚线）
-    if VIZ_LANE_EDGE:
-        bbs = _lane_bboxes(lanes)
-        for i, lane in enumerate(lanes):
-            bb = bbs[i]
-            if bb is None:
-                continue
-            dx = max(bb[0] - pos["x"], 0, pos["x"] - bb[2])
-            dy = max(bb[1] - pos["y"], 0, pos["y"] - bb[3])
-            if dx * dx + dy * dy > 60 * 60:
-                continue
-            hw = (lane.get("width") or 3.5) / 2
-            for side in (1, -1):
-                pts = lane.get("pts", [])
-                edge = []
-                for k, a in enumerate(pts):
-                    b = pts[min(k + 1, len(pts) - 1)]
-                    c = pts[max(k - 1, 0)]
-                    tx, ty = b["x"] - c["x"], b["y"] - c["y"]
-                    tl = math.hypot(tx, ty) or 1.0
-                    nx, ny = -ty / tl * side, tx / tl * side
-                    edge.append(to_scr(a["x"] + nx * hw, a["y"] + ny * hw))
-                if len(edge) < 2:
-                    continue
-                if lane.get("marking") == "Broken":
-                    _dashed_polyline(screen, (255, 255, 255), edge, 6 * max(s, 0.5), 6, 1)
-                else:
-                    pygame.draw.lines(screen, (255, 255, 255), False, edge, 1)
-
-    # 参考路线（蓝实线）
-    if VIZ_REF_LINE:
-        ref = exp.get("ref_path") or []
-        if len(ref) > 1:
-            pygame.draw.lines(screen, (86, 156, 250), False,
-                              [to_scr(p["x"], p["y"]) for p in ref], max(2, round(2.5 * s)))
-    # 预测轨迹（橙虚线）
-    if VIZ_PRED_LINE:
-        pred = exp.get("pred_path") or []
-        if len(pred) > 1:
-            _dashed_polyline(screen, (255, 125, 0), [to_scr(p["x"], p["y"]) for p in pred], 8, 5, 2)
-    # 障碍物（红块）
-    if VIZ_OBSTACLE:
-        for ob in (exp.get("obstacles") or []):
-            q = to_scr(ob.get("x", 0), ob.get("y", 0))
-            sz = max(1.5, ob.get("size") or 2) * K * s
-            r = pygame.Rect(q[0] - sz / 2, q[1] - sz / 2, sz, sz)
-            pygame.draw.rect(screen, (245, 63, 63), r)
-            pygame.draw.rect(screen, (255, 213, 213), r, 1)
-        for ob in (exp.get("planned_obstacles") or []):
-            q = to_scr(ob.get("x", 0), ob.get("y", 0))
-            sz = 2.0 * K * s
-            r = pygame.Rect(q[0] - sz / 2, q[1] - sz / 2, sz, sz)
-            pygame.draw.rect(screen, (245, 120, 63), r, 1)
-    # 感知范围圈（约 50m）
-    if VIZ_RANGE:
-        pygame.draw.circle(screen, (120, 132, 158), (int(cx), int(cy)), int(50 * K * s), 1)
-    # 自车标记
-    if VIZ_EGO_MARK:
-        pygame.draw.circle(screen, (78, 139, 255), (int(cx), int(cy)), max(5, int(7 * s)), 1)
-
-    # 障碍两侧车身可容空间带（后端 build_gap_viz 下发，口径=simple_planner）+
-    # 可容宽标注；绿=带宽≥车宽(可过)，红=不够；以及 EDGE 边界余量保留区(黄带)。
-    # 合并到一个共享 SRCALPHA 层一次性 blit（同车道 overlay 策略），避免每 side
-    # 每帧创建一个大尺寸 Surface 造成分配/合成抖动——这是障碍一出现就卡+高频闪的根源。
-    if (VIZ_GAP_BAND or VIZ_EDGE_MARGIN):
-        gv = exp.get("gap_viz") or {}
-        sides = gv.get("sides") or []
-        if sides:
-            band = pygame.Surface((rect[2], rect[3]), pygame.SRCALPHA)
-            for sd in sides:
-                if VIZ_GAP_BAND:
-                    poly = [to_scr(p[0], p[1]) for p in sd.get("poly", [])]
-                    if len(poly) >= 3:
-                        if sd.get("pass"):
-                            fill, stroke = (60, 210, 90, 70), (60, 210, 90)
-                        else:
-                            fill, stroke = (245, 63, 63, 70), (245, 63, 63)
-                        pygame.draw.polygon(band, fill, poly)
-                        pygame.draw.polygon(band, stroke, poly, 1)
-                if VIZ_EDGE_MARGIN:
-                    ep = sd.get("edge_poly") or []
-                    if len(ep) >= 3:
-                        poly = [to_scr(p[0], p[1]) for p in ep]
-                        pygame.draw.polygon(band, (255, 200, 60, 45), poly)
-                        pygame.draw.polygon(band, (255, 200, 60), poly, 1)
-            screen.blit(band, (rect[0], rect[1]))
-            # 可容带宽度标注（与带同色）
-            if font is not None and VIZ_GAP_BAND:
-                for sd in sides:
-                    lp = to_scr(sd["label"][0], sd["label"][1])
-                    stroke = (60, 210, 90) if sd.get("pass") else (245, 63, 63)
-                    txt = font.render(f"{sd['width']:.1f}", True, stroke)
-                    screen.blit(txt, (int(lp[0] - txt.get_width() / 2),
-                                      int(lp[1] - txt.get_height() / 2)))
-
-    # 自车车宽标注（真实框宽度 = 2×ego_half_w；与可容带带宽对比判断能否通过）
-    if VIZ_EGO_CLEAR and font is not None:
-        req_w = (exp.get("gap_viz") or {}).get("ego_req_w")
-        if req_w:
-            txt = font.render(f"车宽 {req_w}m", True, (0, 200, 255))
-            screen.blit(txt, (int(cx) + 10, int(cy) + 8))
-
-
+# 鸟瞰叠加（当前车道/参考线/预测轨迹/障碍/自车/可容带）已由后端真实投影烧录进
+# bird 帧，本地只 blit 该帧（见 render_comprehensive），不再有 _draw_bird_overlay。
 def render_comprehensive(screen, fonts, surfaces, exp, hist: TelemetryHistory, ctx):
     w, h = screen.get_size()
     # 顶部左鸟瞰、右车前相机（加大高度，底部图表整体下移，互不压盖）
@@ -791,12 +581,9 @@ def render_comprehensive(screen, fonts, surfaces, exp, hist: TelemetryHistory, c
 
     bird = _slot_surf(surfaces, "bird")
     if bird is not None:
+        # 鸟瞰叠加（当前车道/参考线/预测轨迹/障碍/自车/可容带）已由后端烧录进帧，
+        # 本地只 blit 已画好的画面，不在 pygame 侧重复叠加。
         _blit_cover(screen, bird, bird_rect)
-        if exp.get("status") == "running":
-            _draw_bird_overlay(screen, bird_rect, exp, ctx.get("lanes") or [], fonts["sm"])
-            # 3D 框投影线段：与车道线同通道即时绘制，稳定不闪
-            if VIZ_BBOX3D:
-                _overlay_segs(screen, bird_rect, bird.get_size(), exp.get("bird3d"))
     else:
         _placeholder(screen, fonts["md"], bird_rect, _loading_text(exp, "等待车顶俯瞰画面…"))
 

@@ -22,6 +22,8 @@
     2) 主循环编排：每 tick 按数据流调用各层（tick → 定位 → 感知 → 规划 → 控制）；
     3) SSE 推送 / 评分报告 / 顶层 API 路由（start/stop/params/spawn_obstacle）。
 """
+import base64
+
 # ── 分层模块（真实 import；server/ 已由引导壳注入 sys.path）──
 from carla_relay.experiments.comprehensive_driving.context import Exp10Context
 from carla_relay.experiments.comprehensive_driving.reference import ReferenceLine
@@ -40,7 +42,7 @@ from carla_relay.experiments.comprehensive_driving.control import VehicleControl
 from carla_relay.experiments.comprehensive_driving.control_v2 import VehicleControllerV2
 from carla_relay.experiments.comprehensive_driving.viz import (
     render_bbox_overlay, render_semantic_frame, build_sse_payload,
-    overlay_3d_boxes, build_gap_viz,
+    overlay_3d_boxes, build_gap_viz, bake_bird_overlay,
 )
 from carla_relay.experiments.comprehensive_driving.actors import (
     spawn_obstacle_ahead, refresh_route_obstacles, clear_obstacles,
@@ -80,7 +82,12 @@ def _run_exp10(args):
     _EXP_CURRENT_ID = 10
     _EXP_LOG.clear()
     _exp_log("实验10 (闭环自动驾驶) 启动")
-    _sweep_stale_actors()
+    # 未重新规划（起终点/规划参数未变）→ 沿用上次路线绑定障碍物，不在清理窗口销毁；
+    # 重新规划 → 照常清理残留，由下面 clear_obstacles 全量重建。
+    _preserve_obstacle = not _EXP10_PLANNED_CHANGED
+    _sweep_stale_actors(preserve_ids=(
+        {ent["id"] for ent in _EXP10_OBSTACLE_ACTORS} if _preserve_obstacle else ()
+    ))
     _exp_log("正在确定起终点并配置仿真环境…")
 
     duration = float(args.get("duration", 60.0))
@@ -92,6 +99,10 @@ def _run_exp10(args):
     safe_dist = float(args.get("safe_distance", 12.0))
     gnss_noise = float(args.get("gnss_noise", 1.0))
     ins_noise = float(args.get("ins_noise", 0.1))
+    # 鸟瞰相机分辨率/FOV（仅启动时生效；分辨率非法值防护在驱动层 sensor.py 处理）
+    bird_w = args.get("bird_w", 960)
+    bird_h = args.get("bird_h", 960)
+    bird_fov = args.get("bird_fov", 90.0)
     # alpha 互补增益不再作为前端参数：改为由 IMU/GNSS 噪声自适应（噪声小的一方信任更高），
     # 每帧随噪声波动，见 localization.py 顶部 NOISE_JITTER/ALPHA_MIN/ALPHA_MAX/ALPHA_IDLE。
     _exp_log(f"本次参数: gnssσ={gnss_noise:.2f} insσ={ins_noise:.2f} "
@@ -149,7 +160,10 @@ def _run_exp10(args):
         "dec_win": float(args.get("dec_win",
                                   25.0 if planner_kind == "simple" else 60.0)),
         "perception_range": float(args.get("perception_range", 50.0)),
+        "avoid_margin": float(args.get("avoid_margin", 0.1)),
     }
+    # 避障决策窗不得超过感知范围（前端滑块已约束，此处兜底防直调 /start 越界）
+    exp_params["dec_win"] = min(exp_params["dec_win"], exp_params["perception_range"])
     gps_failure = bool(args.get("gps_failure", False))
     spawn_pedestrian = bool(args.get("spawn_pedestrian", False))
     sampling_res = float(args.get("sampling_resolution", 2.0))
@@ -255,11 +269,15 @@ def _run_exp10(args):
         _exp_log("正在挂载传感器（相机 ×4 / LiDAR / GNSS / IMU）…")
         rig = SensorRig(sensor_callback=_sensor_callback, sensor_refs=_sensor_refs,
                         managed_actors=_managed_actors, lock=_lock, log=_exp_log)
-        cam, inst, sem, bird, lidar, gnss, imu, col = rig.spawn(world, vehicle, _push_to_sse)
+        cam, inst, sem, bird, lidar, gnss, imu, col = rig.spawn(
+            world, vehicle, _push_to_sse,
+            bird_w=bird_w, bird_h=bird_h, bird_fov=bird_fov)
         _stream_camera = cam.id
         _stream_bbox = inst.id
         _stream_semantic = sem.id
-        _stream_bird = bird.id
+        # 鸟瞰叠加已由主循环后台烧录后单独推流（见主循环 bake 块），
+        # 关闭通用相机流对 bird 的原样推送，避免传感器回调用未叠加原帧覆盖。
+        _stream_bird = None
 
         # 3.5 只有「重新规划后运行」才清空世界中遗留的车辆/行人（含上次实验残留，重启后仍有效），
         #     并保留本车 ego；反之（停止后调参再启动、未重新规划）则沿用世界已有障碍，不清空。
@@ -722,6 +740,40 @@ def _run_exp10(args):
             _payload["bbox2d"] = _bbox_diag.get("uv2d", [])
             # 透出当前帧自适应 alpha（GNSS 权重）供状态栏动态展示
             _payload["alpha"] = round(loc.alpha, 3)
+
+            # 鸟瞰叠加后台烧录：把车道带/参考线/预测/可容带/障碍框/自车按真实相机
+            # 内参画进 bird 帧。通用相机流已对 bird 关闭（见装配），这里直接以烤录帧
+            # 单独推流 → web 与本地 pygame 都只看这一张已叠加图。纯可视化，异常不影响主循环。
+            #
+            # 关键：绝不可把烧录帧写回 _sensor_frames[bird.id]。相机回调只往那里写原始
+            # 帧；若 bake 也回写，主循环帧率高于相机帧率时，下一 tick 会拿"已叠加过的旧帧"
+            # 当底图再烧一次 → 一帧相机画面上层层累积多帧 overlay（滞留/残影）。
+            # 因此每 tick 都以传感器回调写入的原始帧为底图烧录，只叠加当前这一帧 overlay。
+            _baked = None
+            try:
+                _baked = bake_bird_overlay(
+                    bird_jpeg=_sensor_frames.get(bird.id),
+                    vehicle=vehicle, cam=bird, fused_loc=loc.fused_loc,
+                    fused_yaw_deg=loc.fused_yaw_deg,
+                    route_wp=route_wp, route_lane_ids=route_lane_ids,
+                    ref_path=_payload["experiment"]["ref_path"],
+                    pred_path=_payload["experiment"]["pred_path"],
+                    gap_viz=_gap_viz, viz3d_bird=_viz3d.get("bird"),
+                    cur_lane=_payload["experiment"]["lane"]["cur"])
+            except Exception:
+                _baked = None
+            # 总是推 bird 画面：优先用本帧烧录结果；bake 失败回退传感器原始帧，防空白/卡帧
+            try:
+                _bird_bytes = _baked if _baked is not None else _sensor_frames.get(bird.id)
+                if _bird_bytes:
+                    _push_to_sse({"bird": {
+                        "sensor_id": bird.id,
+                        "base64": base64.b64encode(_bird_bytes).decode(),
+                        "frame_num": _sensor_frame_num.get(bird.id, 0),
+                    }})
+            except Exception:
+                pass
+
             _push_to_sse(_payload)
 
             # 同步模式下 tick 已按固定时间步推进并阻塞至该帧完成，无需额外 sleep
@@ -810,6 +862,29 @@ def _run_exp10(args):
                     _managed_actors.discard(vehicle.id)
             except Exception:
                 pass
+        # 清理残留障碍物及其它仍滞留于 _managed_actors 的托管 actor（本轮生成、
+        # 但未被上面各分支显式销毁的），并同步 discard 出登记表。
+        # 若不在此收尾，这些 actor id 会泄漏到下次运行，被 _sweep_stale_actors
+        # 对已销毁 actor 重复 destroy，触发 CARLA libcarla 原生 Abort（run2+ 崩溃）。
+        # ——但路线绑定障碍物例外：未重新规划时保留在世界中（跨运行沿用），
+        #   便于「停止→调参→再运行」对比自动驾驶参数影响时场景保持一致。
+        _keep_ids = {ent["id"] for ent in _EXP10_OBSTACLE_ACTORS}
+        with _lock:
+            _leftover = [aid for aid in _managed_actors if aid not in _keep_ids]
+        for aid in _leftover:
+            try:
+                actor = world.get_actor(aid)
+                if actor is not None and actor.is_alive:
+                    actor.destroy()
+            except Exception:
+                pass
+            with _lock:
+                _managed_actors.discard(aid)
+            _sensor_frames.pop(aid, None)
+            _sensor_dtype.pop(aid, None)
+            _sensor_refs.pop(aid, None)
+        # 保留路线障碍物及其登记（_EXP10_OBSTACLE_ACTORS 不清空）供下轮复用；
+        # 若下次重新规划，run 开头 clear_obstacles 会按角色全量清掉后再重建。
         # 恢复世界运行模式（同步→原异步），避免残留同步模式导致其他实验卡住
         try:
             if _exp10_old_settings is not None:

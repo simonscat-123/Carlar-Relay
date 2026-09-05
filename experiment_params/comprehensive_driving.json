@@ -6,7 +6,6 @@
   "describe": "闭环自动驾驶：定位 + 控制 + 感知避障，起点终点在鸟瞰图上点选",
   "plan_stage": true,
   "params": {
-    "duration": 60,
     "target_speed": 8.0,
     "kp_steer": 1.4,
     "steer_delay": 0.0,
@@ -14,6 +13,10 @@
     "gnss_noise": 0.05,
     "ins_noise": 0.01,
     "sampling_resolution": 2.0,
+    "algorithm": "astar",
+    "lane_change_cost": 0.0,
+    "intersection_cost": 0.0,
+    "curvature_gain": 0.0,
     "perception": false,
     "aggressive": true,
     "planner": "simple",
@@ -23,6 +26,9 @@
     "tl_brake_window": 80.0,
     "dec_win": 25.0,
     "avoid_margin": 0.1,
-    "perception_range": 50.0
+    "perception_range": 50.0,
+    "bird_w": 960,
+    "bird_h": 960,
+    "bird_fov": 90
   }
 }

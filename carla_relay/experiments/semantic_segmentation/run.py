@@ -310,23 +310,6 @@ def _exp5_ego_project(ego, fwd, lat):
     return gx, gy
 
 
-def _exp5_static_by_pos(ego, tg, t, pos_hist):
-    """跨帧全局位移判定静态：位移速率 < 0.5 m/s 累计 5 帧 → True。
-    不依赖 actor 真值速度，actor 反查失败时仍能正确判定静止。"""
-    gx, gy = _exp5_ego_project(ego, tg.get("fwd", 0.0), tg.get("lat", 0.0))
-    aid = tg.get("id")
-    prev = pos_hist.get(aid)
-    if prev is not None:
-        px, py, pt, pc = prev
-        dt = max(1e-3, t - pt)
-        sp = _math5.hypot(gx - px, gy - py) / dt
-        cnt = pc + 1 if sp < 0.5 else 0
-    else:
-        cnt = 0
-    pos_hist[aid] = (gx, gy, t, cnt)
-    return cnt >= 5
-
-
 def _exp5_fallback_size(ego, tg):
     """actor 反查失败时，用感知估计补尺寸（长度=2×典型半长，宽度=单目宽度，高度=类别典型）。
     位置由车体系投影到全局；vx/vy/ax/ay 无真值置 None（表格显示 —）。"""
@@ -423,7 +406,6 @@ def _run_exp05(args):
     walker_pairs = []  # (walker_actor, controller_actor)，收尾先 stop 再 destroy
     _exp5_vel_state = {}   # 障碍 id -> (vx_w, vy_w, t)，求加速度 / 判静态
     _exp5_still_cnt = {}
-    _exp5_pos_hist = {}    # 障碍 id -> (gx, gy, t, cnt)，跨帧全局位移判静态
     try:
         world.apply_settings(carla.WorldSettings(synchronous_mode=True, fixed_delta_seconds=fixed_delta))
         # 真实 CARLA 天气：写作世界后改变所有相机的真实光线；收尾还原原天气。
@@ -658,8 +640,9 @@ def _run_exp05(args):
                 if _d5 is None:
                     # actor 反查失败：尺寸回退感知估计（不再显示 0）
                     _d5 = _exp5_fallback_size(vehicle, _tg)
-                # 静态判定统一用跨帧位移（不依赖可能失败的 actor 真值）
-                _d5["is_static"] = _exp5_static_by_pos(vehicle, _tg, t, _exp5_pos_hist)
+                # 静态判定沿用 _exp5_actor_metrics 的 actor 真值低速计数（末尾已置位）。
+                # 不要再用跨帧位移覆盖：单目测距的目标 fwd/lat 带像素抖动，静止目标
+                # 每帧位移也能超过 <0.5m/s 阈值 → 永远判成“移动”。保持 actor 真值即可。
                 rich[_tg.get("id")] = _d5
 
             # 深度相机画面：按 depth_range 对数灰度 + 截断（超距置黑）

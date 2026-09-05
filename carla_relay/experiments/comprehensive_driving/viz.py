@@ -371,18 +371,11 @@ def build_gap_viz(reference, obstacles, ego_half_w, ego_half_len, ego_s=None,
             poly = [reference.world(s_lo, l_a), reference.world(s_hi, l_a),
                     reference.world(s_hi, l_b), reference.world(s_lo, l_b)]
             lx, ly = reference.world(o["s"], (l_a + l_b) / 2)
-            # EDGE 边界余量保留区：可容带外侧 → 探测域边界（本车不会进入）
-            e_in = l_a if side < 0 else l_b
-            e_out = best_iv[0] if side < 0 else best_iv[1]
-            e_poly = [reference.world(s_lo, e_in), reference.world(s_hi, e_in),
-                      reference.world(s_hi, e_out), reference.world(s_lo, e_out)]
             out["sides"].append({
                 "poly": [[round(p[0], 2), round(p[1], 2)] for p in poly],
                 "width": round(max(0.0, corridor), 2),
                 "pass": corridor >= 2 * ego_half_w,
                 "label": [round(lx, 2), round(ly, 2)],
-                "edge_poly": [[round(p[0], 2), round(p[1], 2)] for p in e_poly],
-                "edge_margin": round(EDGE_MARGIN, 2),
             })
             _log_lines.append((side, free, corridor, corridor >= 2 * ego_half_w))
         # 宽度诊断：每障碍首次出现打一次（探测域/两侧空闲/可容宽/可否通过）
@@ -397,6 +390,184 @@ def build_gap_viz(reference, obstacles, ego_half_w, ego_half_len, ego_s=None,
             log(f"GAP 障碍#{oid} {o['cls']}@s={o['s']:.1f} l={o['l']:+.2f} "
                 f"半长={o['half_len']:.2f} 半宽={o['half_w']:.2f} ivs={_ivs_txt} | {_side_txt}")
     return out
+
+
+# ── 鸟瞰叠加后台烧录（web + local_runner 统一走同一张烧录帧）──────────
+_small_font_cache = None
+
+
+def _small_font():
+    """宽度标注小字号字体：优先常见 TTF，回退 PIL 默认位图字体。"""
+    global _small_font_cache
+    if _small_font_cache is None:
+        for name in ("msyh.ttc", "simhei.ttf", "arial.ttf"):
+            try:
+                _small_font_cache = PIL.ImageFont.truetype(name, 18)
+                break
+            except Exception:
+                continue
+        if _small_font_cache is None:
+            _small_font_cache = PIL.ImageFont.load_default()
+    return _small_font_cache
+
+
+def bake_bird_overlay(*, bird_jpeg, vehicle, cam, fused_loc, fused_yaw_deg,
+                      route_wp, route_lane_ids, ref_path, pred_path, gap_viz,
+                      viz3d_bird, cur_lane=None):
+    """后台烧录：把综合驾驶鸟瞰相机的全部叠加元素，用真实相机内参（_project_points）
+    直接绘制进 bird JPEG 帧。web 前端与本地 pygame 都只显示这张已叠加的图，不再各自
+    在画布上重绘 → 三端逐像素一致、无漂移。
+
+    叠加内容（自下而上）：感知范围圈 → 当前车道带宽 + 两缘 → 参考线 → 预测轨迹 →
+    可容带 gap（绿/红带 + 宽度文字）→ 障碍足迹框（黄真实/红虚线余量）→
+    自车标记。任一环节异常只跳过该段，绝不影响驾驶主循环与其余叠加。
+    返回叠加后的 JPEG bytes；帧缺失/解码失败时原样返回。
+    """
+    if not bird_jpeg:
+        return bird_jpeg
+    try:
+        base = PIL.Image.open(io.BytesIO(bird_jpeg)).convert("RGB")
+        w, h = base.size
+    except Exception:
+        return bird_jpeg
+    ol = PIL.Image.new("RGBA", (w, h), (0, 0, 0, 0))   # 半透明合成层（RGB→RGBA 混合再落图）
+    od = PIL.ImageDraw.Draw(ol)
+    font = _small_font()
+    ground_z = fused_loc.z - 0.9
+
+    def proj(xys):
+        """世界 (x,y) 列表 → bird 像素；z 取地面高度（鸟瞰正下视贴合路面）。"""
+        return _project_points([carla.Location(float(x), float(y), ground_z)
+                                for x, y in xys], vehicle, cam, w, h)
+
+    def stroke(pix, color, width=2, closed=False):
+        pts = [p for p in pix if p is not None]
+        for i in range(len(pts) - 1):
+            od.line(pts[i] + pts[i + 1], fill=color, width=width)
+        if closed and len(pts) >= 2:
+            od.line(pts[-1] + pts[0], fill=color, width=width)
+
+    def polyfill(xys, fill, outline=None, ow=2):
+        pix = proj(xys)
+        good = [p for p in pix if p is not None]
+        if len(good) < 3:
+            return
+        od.polygon(good, fill=fill)
+        if outline is not None:
+            stroke(pix, outline, ow, closed=True)
+
+    def polyline(xys, color, width=2, dashed=False):
+        pix = proj(xys)
+        pts = [p for p in pix if p is not None]
+        for i in range(len(pts) - 1):
+            if dashed:
+                _dashed(od, pts[i], pts[i + 1], color, width=width, dash=8, gap=5)
+            else:
+                od.line(pts[i] + pts[i + 1], fill=color, width=width)
+
+    # ① 感知范围圈（约 50m；半径按鸟瞰相机真实内参换算 px/m 自适应，
+    #    随 fov/分辨率/俯视高度的变化贴合实际视野，仅视觉示意不影响决策）
+    try:
+        ec = proj([(fused_loc.x, fused_loc.y)])[0]
+    except Exception:
+        ec = None
+    if ec is not None:
+        try:
+            _cam_fov = float(cam.attributes.get("fov", 90))
+            _cam_z = cam.get_transform().location.z          # 世界俯视相机高度
+            _eff_z = max(_cam_z - ground_z, 1.0)             # 相机相对路面有效高度
+            _px_per_m = (w / 2.0) / (_eff_z * math.tan(math.radians(_cam_fov) / 2.0))
+        except Exception:
+            _px_per_m = w / 90.0                             # 回退：fov90/z45 近似
+        r = 50 * _px_per_m
+        od.ellipse([ec[0] - r, ec[1] - r, ec[0] + r, ec[1] + r],
+                   outline=(120, 132, 158, 80), width=1)
+
+    # ② 当前车道带宽（仅当前车道：沿路线取 lane id 与 cur 一致的路线点为中心线，
+    #    各点沿横向法向扩 ±width/2 成四边形带）
+    if cur_lane:
+        width_m = None
+        center = []
+        for j in range(len(route_wp)):
+            lk = route_lane_ids[j] if j < len(route_lane_ids) else None
+            if lk is None or lk[0] != cur_lane[0] or lk[1] != cur_lane[1]:
+                continue
+            wp = route_wp[j]
+            if math.hypot(wp.x - fused_loc.x, wp.y - fused_loc.y) > 90.0:
+                continue
+            center.append((wp.x, wp.y))
+            if width_m is None:
+                width_m = getattr(wp, "lane_width", None) or None
+        width_m = width_m or 3.5
+        if len(center) >= 2:
+            hw = width_m / 2.0
+            left, right = [], []
+            for i, (x, y) in enumerate(center):
+                ax, ay = center[max(i - 1, 0)]
+                bx, by = center[min(i + 1, len(center) - 1)]
+                tx, ty = bx - ax, by - ay
+                tl2 = math.hypot(tx, ty)
+                nx, ny = (-ty / tl2, tx / tl2) if tl2 > 1e-6 else (0.0, 1.0)
+                left.append((x + nx * hw, y + ny * hw))
+                right.append((x - nx * hw, y - ny * hw))
+            if len(left) >= 2:
+                polyfill(left + right[::-1], (54, 89, 255, 70),
+                         outline=(54, 89, 255, 150), ow=2)
+
+    # ③ 参考线（含换道 S 弯）
+    if len(ref_path or []) >= 2:
+        polyline([(p["x"], p["y"]) for p in ref_path], (54, 89, 255, 235), width=3)
+
+    # ④ 预测轨迹（橙虚线）
+    if len(pred_path or []) >= 2:
+        polyline([(p["x"], p["y"]) for p in pred_path], (255, 125, 0, 245),
+                 width=2, dashed=True)
+
+    # ⑤ 可容带 gap：poly（pass 绿/红）+ 宽度文字
+    for sd in (gap_viz or {}).get("sides", []) or []:
+        pass_ok = sd.get("pass")
+        col = (60, 210, 90, 80) if pass_ok else (245, 63, 63, 80)
+        if sd.get("poly"):
+            polyfill(sd["poly"], col, outline=col, ow=2)
+        if sd.get("label") and sd.get("width") is not None:
+            lp = proj([tuple(sd["label"])])[0]
+            if lp is not None:
+                txt = f"{sd['width']:.1f}"
+                tc = (60, 210, 90) if pass_ok else (245, 63, 63)
+                od.text((lp[0] - od.textlength(txt, font=font) / 2,
+                         lp[1] - getattr(font, "size", 12) / 2),
+                        txt, fill=(tc[0], tc[1], tc[2], 255), font=font)
+
+    # ⑥ 障碍足迹框 + 余量虚线框（复用 overlay_3d_boxes 产出的归一化 UV 线段）
+    for rec in (viz3d_bird or []) or []:
+        color = tuple(rec.get("color", [255, 60, 60])) + (235,)
+        for a, b in rec.get("segs", []) or []:
+            p0 = (a[0] * w, a[1] * h)
+            p1 = (b[0] * w, b[1] * h)
+            if rec.get("dashed"):
+                _dashed(od, p0, p1, color, width=2)
+            else:
+                od.line(p0 + p1, fill=color, width=2)
+
+    # ⑦ 自车标记（浅蓝圆点 + 沿航向小三角/短线；投影确保贴合真实位姿）
+    if ec is not None:
+        fw = math.radians(fused_yaw_deg)
+        fx, fy = math.cos(fw), math.sin(fw)
+        ahead = proj([(fused_loc.x + fx * 3.0, fused_loc.y + fy * 3.0)])[0]
+        od.ellipse([ec[0] - 7, ec[1] - 7, ec[0] + 7, ec[1] + 7],
+                   fill=(78, 139, 255, 235), outline=(78, 139, 255, 235), width=2)
+        if ahead is not None:
+            od.line(ec + ((ahead[0] * 0.25 + ec[0] * 0.75), (ahead[1] * 0.25 + ec[1] * 0.75)),
+                    fill=(78, 139, 255, 235), width=2)
+
+    # 合成半透明层 → RGB，输出 JPEG
+    try:
+        merged = PIL.Image.alpha_composite(base.convert("RGBA"), ol).convert("RGB")
+        buf = io.BytesIO()
+        merged.save(buf, format="JPEG", quality=70)
+        return buf.getvalue()
+    except Exception:
+        return bird_jpeg
 
 
 def overlay_3d_boxes(*, vehicle, fused_loc, fused_yaw_deg, obstacles, reference,
@@ -491,9 +662,12 @@ def overlay_3d_boxes(*, vehicle, fused_loc, fused_yaw_deg, obstacles, reference,
 
     for cam, full3d in ((inst, True), (bird, False)):
         tag = "bbox" if full3d else "bird"
+        # 本相机待烧录进帧的 3D 线框（仅 inst/bbox 烧；bird 保持原始帧，由
+        # bake_bird_overlay 单独烧足迹框，避免重复叠加）。
+        _px_boxes: list = []
         try:
             # 投影基底帧：inst 用本 tick 的干净 bbox 帧（含 2D 检测框，不含 3D）；
-            # bird 用帧缓存原始俯瞰帧。仅取尺寸用于投影，3D 框不再刻进 JPEG。
+            # bird 用帧缓存原始俯瞰帧。仅取尺寸用于投影，3D 框随即烧进 bbox 帧。
             if cam.id == inst.id and inst_frame is not None:
                 jpeg = inst_frame
                 write_back = True
@@ -511,6 +685,10 @@ def overlay_3d_boxes(*, vehicle, fused_loc, fused_yaw_deg, obstacles, reference,
                 # 障碍「真实体积」实线框：两相机都不画（右侧保留 2D bbox +
                 # 虚线余量框；鸟瞰保留虚线余量框）。
                 if rec.get("obs_real"):
+                    continue
+                # 自车 3D 框：只画在鸟瞰(bird, full3d=False) 足迹；右侧车前相机
+                # (full3d=True) 不画本车框（避免挡画面），仅保留障碍 2D bbox/虚线框。
+                if rec.get("ego") and full3d:
                     continue
                 pts_ok = rec["pts"]
                 if full3d and len(pts_ok) >= 8:
@@ -551,9 +729,38 @@ def overlay_3d_boxes(*, vehicle, fused_loc, fused_yaw_deg, obstacles, reference,
                 out[tag].append({"segs": segs,
                                  "color": list(rec["color"]),
                                  "dashed": rec["dashed"]})
-            # 干净 bbox 帧写回推流（只含 2D 检测框）；bird 保持原始俯瞰帧，皆不叠 3D。
+                # 收集 bbox(inst) 相机的像素级线框，稍后统一烧进 bbox 帧（后端
+                # 烧录 → web / 本地都只显示这张已含 3D 框的帧，不再各自在前端画）。
+                if full3d:
+                    _px_boxes.append({
+                        "pixels": pixels, "edges": edges,
+                        "color": rec["color"], "dashed": rec["dashed"]})
+            # 后端把 3D 线框烧进 bbox 帧再写回推流（与前端原先 drawBbox3d 同一投影
+            # 数据，仅改为在服务端刻进 JPEG）；bird 保持原始俯瞰帧，由 bake_bird_overlay 烧。
             if write_back:
-                sensor_frames[inst.id] = inst_frame
+                try:
+                    if _px_boxes and inst_frame:
+                        base = PIL.Image.open(io.BytesIO(inst_frame)).convert("RGB")
+                        dr = PIL.ImageDraw.Draw(base)
+                        for bx in _px_boxes:
+                            col = tuple(bx["color"][:3])
+                            pts = bx["pixels"]
+                            for ia, ib in bx["edges"]:
+                                a, b = pts.get(ia), pts.get(ib)
+                                if a is None or b is None:
+                                    continue
+                                p0 = (a[0], a[1]); p1 = (b[0], b[1])
+                                if bx["dashed"]:
+                                    _dashed(dr, p0, p1, col, width=2)
+                                else:
+                                    dr.line(p0 + p1, fill=col, width=2)
+                        buf = io.BytesIO()
+                        base.save(buf, format="JPEG", quality=80)
+                        sensor_frames[inst.id] = buf.getvalue()
+                    else:
+                        sensor_frames[inst.id] = inst_frame
+                except Exception:
+                    sensor_frames[inst.id] = inst_frame
                 if sensor_frame_num is not None:
                     sensor_frame_num[inst.id] = sensor_frame_num.get(inst.id, 0) + 1
         except Exception:

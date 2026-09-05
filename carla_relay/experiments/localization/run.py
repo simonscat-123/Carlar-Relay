@@ -322,9 +322,10 @@ def _run_exp23(args):
                          f"{acc_meas['z']:+.2f}) 重力补偿后=({ax_body:+.2f},{ay_body:+.2f}) "
                          f"GNSS=({gnss_data['latitude']:.6f},{gnss_data['longitude']:.6f})")
 
-            # INS 积分（速度限幅防发散）
-            ins_vx = max(-25.0, min(25.0, ins_vx + ax_world * dt))
-            ins_vy = max(-25.0, min(25.0, ins_vy + ay_world * dt))
+            # INS 积分（速度限幅防发散）。有效噪声 eff_ins 单位为 m/s（速度测量噪声），
+            # 直接叠加到推算速度上，而非加速度域。
+            ins_vx = max(-25.0, min(25.0, ins_vx + ax_world * dt + rng.gauss(0, eff_ins)))
+            ins_vy = max(-25.0, min(25.0, ins_vy + ay_world * dt + rng.gauss(0, eff_ins)))
             ins_x += ins_vx * dt
             ins_y += ins_vy * dt
 
