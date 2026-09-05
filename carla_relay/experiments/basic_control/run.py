@@ -65,12 +65,17 @@ def _run_exp01(args):
 
         total = int(duration / fixed_delta)
         rows = []
+        # 相对时间基准：elapsed_seconds 是会话累计世界时钟，须以首采集帧为 0 起点
+        t0 = None
         for i in range(total):
             if _EXP01_ABORT:
                 break
             world.tick()
             snap = world.get_snapshot()
             t = snap.timestamp.elapsed_seconds
+            if t0 is None:
+                t0 = t
+            t = t - t0
             tform = vehicle.get_transform()
             rows.append({"frame": i + 1, "time": t, "x": tform.location.x, "y": tform.location.y, "yaw": tform.rotation.yaw})
             if i % 4 == 0:

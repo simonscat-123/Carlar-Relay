@@ -214,6 +214,7 @@ def _run_exp23(args):
         last_t = None
         trajectory = []
         total_ticks = int(duration / fixed_delta)
+        t0 = None           # 采集起始时刻（世界时间），用于记录相对时间
 
         # 航向融合与闭环控制状态
         fused_yaw_deg = 0.0
@@ -271,6 +272,7 @@ def _run_exp23(args):
 
             # --- 初始化（首帧不跳过，对齐 exp03：dt=1e-3，从 llh_to_local 零位开始积分）---
             if last_t is None:
+                t0 = t_sim          # 记录采集零时刻，作为相对时间的基准
                 lat0 = gnss_data["latitude"]
                 lon0 = gnss_data["longitude"]
                 alt0 = gnss_data["altitude"]
@@ -406,9 +408,9 @@ def _run_exp23(args):
             if abs(cte_gt) > max(0.5, lane_half - 0.9):
                 offlane_ticks += 1
 
-            # 推送到 SSE
+            # 推送到 SSE（t 为相对采集起点的相对时间）
             point = {
-                "t": round(t_sim, 2),
+                "t": round(t_sim - t0, 2),
                 "gnss_x": round(gx, 3) if gnss_valid else None,
                 "gnss_y": round(gy, 3) if gnss_valid else None,
                 "gnss_x_raw": round(gx_raw, 3),

@@ -152,6 +152,8 @@ def _run_exp09(args):
         rows = []
         wp_idx = 0
         pid_err, pid_int = 0.0, 0.0
+        # 相对时间基准：elapsed_seconds 是会话累计世界时钟，须以首采集帧为 0 起点
+        t0 = None
 
         for i in range(total):
             if _EXP09_ABORT:
@@ -159,6 +161,9 @@ def _run_exp09(args):
             world.tick()
             snap = world.get_snapshot()
             t = snap.timestamp.elapsed_seconds
+            if t0 is None:
+                t0 = t
+            t = t - t0
             tform = vehicle.get_transform()
             vel = vehicle.get_velocity()
             speed = math.sqrt(vel.x ** 2 + vel.y ** 2 + vel.z ** 2)
