@@ -833,56 +833,62 @@ def _run_exp10(args):
             except Exception:
                 pass
             _plan_log_f = None
-        # 清理传感器（驱动层）：先停止监听（断开流），再销毁
-        _stream_bird = None
-        _stream_camera = None
-        _stream_semantic = None
-        _stream_bbox = None
-        if rig is not None:
-            try:
-                rig.cleanup(world)
-            except Exception as exc:
-                _exp_log(f"传感器清理异常: {exc!r}")
-        # 清理行人
-        for obj in _EXP10_PEDI:
-            try:
-                if obj and obj.is_alive:
-                    obj.destroy()
-                with _lock:
-                    _managed_actors.discard(obj.id)
-            except Exception:
-                pass
-        _EXP10_PEDI.clear()
-        # 清理车辆
-        if vehicle is not None:
-            try:
-                if vehicle.is_alive:
-                    vehicle.destroy()
-                with _lock:
-                    _managed_actors.discard(vehicle.id)
-            except Exception:
-                pass
-        # 清理残留障碍物及其它仍滞留于 _managed_actors 的托管 actor（本轮生成、
-        # 但未被上面各分支显式销毁的），并同步 discard 出登记表。
-        # 若不在此收尾，这些 actor id 会泄漏到下次运行，被 _sweep_stale_actors
-        # 对已销毁 actor 重复 destroy，触发 CARLA libcarla 原生 Abort（run2+ 崩溃）。
-        # ——但路线绑定障碍物例外：未重新规划时保留在世界中（跨运行沿用），
-        #   便于「停止→调参→再运行」对比自动驾驶参数影响时场景保持一致。
-        _keep_ids = {ent["id"] for ent in _EXP10_OBSTACLE_ACTORS}
-        with _lock:
-            _leftover = [aid for aid in _managed_actors if aid not in _keep_ids]
-        for aid in _leftover:
-            try:
-                actor = world.get_actor(aid)
-                if actor is not None and actor.is_alive:
-                    actor.destroy()
-            except Exception:
-                pass
+        # 清理传感器（驱动层）：先停止监听（断开流），再销毁。
+        # 注意：以下所有对 carla.Client 的销毁 RPC 必须与 SSE 线程的 world.get_actor
+        # 串行执行——并发调用同一 Client 在 Windows 上会触发 streaming client Fatal
+        # abort（进程级崩溃，见 carla_relay_core._sse_stream_thread 的各自说明）。
+        # 持锁期间 SSE 线程抢锁失败自动跳帧，不阻塞推流。
+        _stream_vehicle = None
+        with _stream_io_guard:
+            _stream_bird = None
+            _stream_camera = None
+            _stream_semantic = None
+            _stream_bbox = None
+            if rig is not None:
+                try:
+                    rig.cleanup(world)
+                except Exception as exc:
+                    _exp_log(f"传感器清理异常: {exc!r}")
+            # 清理行人
+            for obj in _EXP10_PEDI:
+                try:
+                    if obj and obj.is_alive:
+                        obj.destroy()
+                    with _lock:
+                        _managed_actors.discard(obj.id)
+                except Exception:
+                    pass
+            _EXP10_PEDI.clear()
+            # 清理车辆
+            if vehicle is not None:
+                try:
+                    if vehicle.is_alive:
+                        vehicle.destroy()
+                    with _lock:
+                        _managed_actors.discard(vehicle.id)
+                except Exception:
+                    pass
+            # 清理残留障碍物及其它仍滞留于 _managed_actors 的托管 actor（本轮生成、
+            # 但未被上面各分支显式销毁的），并同步 discard 出登记表。
+            # 若不在此收尾，这些 actor id 会泄漏到下次运行，被 _sweep_stale_actors
+            # 对已销毁 actor 重复 destroy，触发 CARLA libcarla 原生 Abort（run2+ 崩溃）。
+            # ——但路线绑定障碍物例外：未重新规划时保留在世界中（跨运行沿用），
+            #   便于「停止→调参→再运行」对比自动驾驶参数影响时场景保持一致。
+            _keep_ids = {ent["id"] for ent in _EXP10_OBSTACLE_ACTORS}
             with _lock:
-                _managed_actors.discard(aid)
-            _sensor_frames.pop(aid, None)
-            _sensor_dtype.pop(aid, None)
-            _sensor_refs.pop(aid, None)
+                _leftover = [aid for aid in _managed_actors if aid not in _keep_ids]
+            for aid in _leftover:
+                try:
+                    actor = world.get_actor(aid)
+                    if actor is not None and actor.is_alive:
+                        actor.destroy()
+                except Exception:
+                    pass
+                with _lock:
+                    _managed_actors.discard(aid)
+                _sensor_frames.pop(aid, None)
+                _sensor_dtype.pop(aid, None)
+                _sensor_refs.pop(aid, None)
         # 保留路线障碍物及其登记（_EXP10_OBSTACLE_ACTORS 不清空）供下轮复用；
         # 若下次重新规划，run 开头 clear_obstacles 会按角色全量清掉后再重建。
         # 恢复世界运行模式（同步→原异步），避免残留同步模式导致其他实验卡住

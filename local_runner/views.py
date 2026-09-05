@@ -452,7 +452,6 @@ _OBST_COLS = [
     ("长", "length", 50, "2f"), ("宽", "width", 50, "2f"), ("高", "height", 50, "2f"),
     ("vx", "vx", 52, "2f"), ("vy", "vy", 52, "2f"),
     ("ax", "ax", 52, "2f"), ("ay", "ay", 52, "2f"),
-    ("静态", "is_static", 56, "bool"),
 ]
 
 
@@ -463,10 +462,6 @@ def _fmt_obst(ob, key, fmt):
     if fmt == "cls":
         cls = str(v or "")
         return _OBSTACLE_CLS.get(cls, cls or "目标"), cls
-    if fmt == "bool":
-        if v is None:
-            return "—", None
-        return ("是" if v else "否"), bool(v)
     if fmt == "1f":
         return "—" if v is None else f"{v:.1f}"
     if fmt == "2f":
@@ -478,21 +473,21 @@ def _fmt_obst(ob, key, fmt):
 
 def _draw_obstacle_full_table(screen, fonts, rect, obstacles, total, status):
     """整宽障碍物详细表格：pose(x,y,z,yaw) / size(l,w,h) / velocity(vx,vy) /
-    acceleration(ax,ay) / is_static，按距离近→远最多 5 行。"""
+    acceleration(ax,ay)，按距离近→远最多 5 行。"""
     x, y, w, h = rect
     pygame.draw.rect(screen, PANEL_BG, rect)
     pygame.draw.rect(screen, PANEL_BORDER, rect, 1)
     cols = _OBST_COLS
 
     # 标题行 + 右上状态（识别总数 + 等级/决策/进度）
-    screen.blit(fonts["md"].render("障碍物详细 (pose · size · velocity · accel · static)", True, TEXT),
+    screen.blit(fonts["md"].render("障碍物详细 (pose · size · velocity · accel)", True, TEXT),
                 (x + 8, y + 4))
     st = fonts["sm"].render(status, True, (255, 220, 120))
     screen.blit(st, (x + w - st.get_width() - 8, y + 6))
 
     # 分组表头
     gy = y + 26
-    gsplit = {5: "Pose", 9: "Size", 11: "Velocity(自车系)", 13: "Accel(自车系)"}
+    gsplit = {5: "Pose", 9: "Size", 11: "Velocity(自车系)", 12: "Accel(自车系)"}
     g_labels = {}
     # 列宽按窗口可用宽度等比伸缩，避免右侧留白
     _tw = sum(cw for _l, _k, cw, _f in cols) or 1
@@ -526,10 +521,6 @@ def _draw_obstacle_full_table(screen, fonts, rect, obstacles, total, status):
                 name, clsk = _fmt_obst(ob, key, fmt)
                 col = (120, 200, 255) if clsk == "vehicle" else (250, 170, 60) if clsk == "walker" else TEXT
                 screen.blit(fonts["sm"].render(name, True, col), (tx, ry))
-            elif fmt == "bool":
-                txt, val = _fmt_obst(ob, key, fmt)
-                col = (140, 220, 150) if val is True else (255, 150, 100) if val is False else TEXT_DIM
-                screen.blit(fonts["sm"].render(txt, True, col), (tx, ry))
             else:
                 screen.blit(fonts["sm"].render(_fmt_obst(ob, key, fmt), True, TEXT), (tx, ry))
 

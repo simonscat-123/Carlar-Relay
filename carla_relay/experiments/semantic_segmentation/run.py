@@ -249,10 +249,10 @@ def _exp5_lane_geoms(world, ego_tf, *, front=60.0, step=1.5, fov_deg=90.0):
     return geoms
 
 
-def _exp5_actor_metrics(world, ego, aid, t, vel_state, still_cnt):
+def _exp5_actor_metrics(world, ego, aid, t, vel_state):
     """由真实 actor id 反查完整物理量：pose(全局 xyz/自身 yaw 弧度)、
-    size(lwh)、velocity/acceleration(转自车系：前向 vx、左向 vy)、is_static。
-    vel_state[id]=(vx_w, vy_w, t)；still_cnt[id] 为低速连续计数。"""
+    size(lwh)、velocity/acceleration(转自车系：前向 vx、左向 vy)。
+    vel_state[id]=(vx_w, vy_w, t)，用于求加速度。"""
     if aid is None:
         return None
     try:
@@ -269,7 +269,7 @@ def _exp5_actor_metrics(world, ego, aid, t, vel_state, still_cnt):
         return None
     out = {"x": 0.0, "y": 0.0, "z": 0.0, "yaw": 0.0,
            "length": 0.0, "width": 0.0, "height": 0.0,
-           "vx": 0.0, "vy": 0.0, "ax": 0.0, "ay": 0.0, "is_static": False}
+           "vx": 0.0, "vy": 0.0, "ax": 0.0, "ay": 0.0}
     tl = actor.get_transform()
     out["x"], out["y"], out["z"] = tl.location.x, tl.location.y, tl.location.z
     out["yaw"] = _math5.radians(tl.rotation.yaw)
@@ -292,11 +292,6 @@ def _exp5_actor_metrics(world, ego, aid, t, vel_state, still_cnt):
         out["ax"] = awx * c + awy * s
         out["ay"] = -awx * s + awy * c
     vel_state[aid] = (v.x, v.y, t)
-    if v.x * v.x + v.y * v.y < 0.25:          # 速度模 < 0.5 m/s
-        still_cnt[aid] = still_cnt.get(aid, 0) + 1
-    else:
-        still_cnt[aid] = 0
-    out["is_static"] = still_cnt.get(aid, 0) >= 5
     return out
 
 
@@ -319,8 +314,7 @@ def _exp5_fallback_size(ego, tg):
             "length": round(2.0 * tg.get("half_len", 1.5), 2),
             "width": round(tg.get("width_m", 0.8), 2),
             "height": round(1.8 if cls == "walker" else 1.5, 2),
-            "vx": None, "vy": None, "ax": None, "ay": None,
-            "is_static": False}
+            "vx": None, "vy": None, "ax": None, "ay": None}
 
 
 def _exp5_depth_gray_jpeg(raw, h, w, max_range):
@@ -404,8 +398,7 @@ def _run_exp05(args):
 
     actors = []
     walker_pairs = []  # (walker_actor, controller_actor)，收尾先 stop 再 destroy
-    _exp5_vel_state = {}   # 障碍 id -> (vx_w, vy_w, t)，求加速度 / 判静态
-    _exp5_still_cnt = {}
+    _exp5_vel_state = {}   # 障碍 id -> (vx_w, vy_w, t)，求加速度
     try:
         world.apply_settings(carla.WorldSettings(synchronous_mode=True, fixed_delta_seconds=fixed_delta))
         # 真实 CARLA 天气：写作世界后改变所有相机的真实光线；收尾还原原天气。
@@ -425,7 +418,7 @@ def _run_exp05(args):
         except Exception:
             pass
         # 关闭 hybrid physics：该模式下 NPC 无真实物理，get_velocity() 恒为 0，
-        # 会让障碍物表格速度/加速度/静态判定全部失真。改为完整物理模拟。
+        # 会让障碍物表格速度/加速度失真。改为完整物理模拟。
         try:
             tm.set_hybrid_physics_mode(False)
         except Exception:
@@ -633,16 +626,12 @@ def _run_exp05(args):
                 except Exception as _exp5e:
                     _exp_log(f"感知融合异常: {_exp5e!r}")
 
-            # 障碍物 rich 信息：反查真实 actor 补齐 pose/size/速度/加速度/静态判定
+            # 障碍物 rich 信息：反查真实 actor 补齐 pose/size/速度/加速度
             for _tg in targets:
-                _d5 = _exp5_actor_metrics(world, vehicle, _tg.get("id"), t,
-                                          _exp5_vel_state, _exp5_still_cnt)
+                _d5 = _exp5_actor_metrics(world, vehicle, _tg.get("id"), t, _exp5_vel_state)
                 if _d5 is None:
                     # actor 反查失败：尺寸回退感知估计（不再显示 0）
                     _d5 = _exp5_fallback_size(vehicle, _tg)
-                # 静态判定沿用 _exp5_actor_metrics 的 actor 真值低速计数（末尾已置位）。
-                # 不要再用跨帧位移覆盖：单目测距的目标 fwd/lat 带像素抖动，静止目标
-                # 每帧位移也能超过 <0.5m/s 阈值 → 永远判成“移动”。保持 actor 真值即可。
                 rich[_tg.get("id")] = _d5
 
             # 深度相机画面：按 depth_range 对数灰度 + 截断（超距置黑）
@@ -695,9 +684,6 @@ def _run_exp05(args):
                         "height": _v5("height", 2),
                         "vx": _v5("vx", 2), "vy": _v5("vy", 2),
                         "ax": _v5("ax", 2), "ay": _v5("ay", 2),
-                        "is_static": (bool(_ec.get("is_static", False))
-                                      if _ok5 and _ec.get("is_static") is not None
-                                      else None),
                     })
                 pt["obstacles"] = _obs5
                 pt["bev"] = bev_payload

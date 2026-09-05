@@ -270,29 +270,36 @@ def _sse_stream_thread():
                 continue
             msg = {"ts": time.time()}
             vid = _stream_vehicle
-            # 车辆状态
-            if vid is not None:
-                actor = world.get_actor(vid)
-                if actor is not None and actor.is_alive:
-                    v = actor
-                    loc = v.get_location()
-                    vel = v.get_velocity()
-                    t = v.get_transform()
-                    msg["vehicle"] = {
-                        "id": vid,
-                        "location": {"x": round(loc.x, 2), "y": round(loc.y, 2), "z": round(loc.z, 2)},
-                        "transform": {
-                            "rotation": {"pitch": round(t.rotation.pitch, 2),
-                                         "yaw": round(t.rotation.yaw, 2),
-                                         "roll": round(t.rotation.roll, 2)}
-                        },
-                        "speed_ms": round(math.sqrt(vel.x**2 + vel.y**2 + vel.z**2), 2),
-                        "speed_kmh": round(math.sqrt(vel.x**2 + vel.y**2 + vel.z**2) * 3.6, 1),
-                        "is_alive": True,
-                        "autopilot": _autopilot_state.get(vid, True),
-                    }
-                else:
-                    msg["vehicle"] = {"id": vid, "is_alive": False}
+            # 车辆状态：world.get_actor 是对 carla.Client 的一次 RPC。实验线程销毁
+            # actor（teardown）期间并发调用同一 Client，会触发 Windows 下的
+            # "streaming client: connection failed" Fatal abort。故此处用
+            # _stream_io_guard 与 teardown 串行：抢锁失败则本周期跳过车辆帧，
+            # 不阻塞相机/传感器推流（与 teardown 互斥，保证销毁时无并发 RPC）。
+            if vid is not None and _stream_io_guard.acquire(timeout=0.2):
+                try:
+                    actor = world.get_actor(vid)
+                    if actor is not None and actor.is_alive:
+                        v = actor
+                        loc = v.get_location()
+                        vel = v.get_velocity()
+                        t = v.get_transform()
+                        msg["vehicle"] = {
+                            "id": vid,
+                            "location": {"x": round(loc.x, 2), "y": round(loc.y, 2), "z": round(loc.z, 2)},
+                            "transform": {
+                                "rotation": {"pitch": round(t.rotation.pitch, 2),
+                                             "yaw": round(t.rotation.yaw, 2),
+                                             "roll": round(t.rotation.roll, 2)}
+                            },
+                            "speed_ms": round(math.sqrt(vel.x**2 + vel.y**2 + vel.z**2), 2),
+                            "speed_kmh": round(math.sqrt(vel.x**2 + vel.y**2 + vel.z**2) * 3.6, 1),
+                            "is_alive": True,
+                            "autopilot": _autopilot_state.get(vid, True),
+                        }
+                    else:
+                        msg["vehicle"] = {"id": vid, "is_alive": False}
+                finally:
+                    _stream_io_guard.release()
             # 三目相机（左/前/右）：帧号对齐时原子推送同批画面；
             # 未对齐/非三目实验回退逐槽推送（保持原行为）
             if not _frame_msg_triplet(msg):
@@ -416,6 +423,10 @@ _semantic_preset: str = "7"  # 当前语义分割类别预设（7 / 22），运�
 _camera_actor_ref: Any = None  # 防止相机 actor 被 GC 导致 listen() 回调失效
 _sensor_refs: Dict[int, Any] = {}  # 保持所有带 listen() 的 sensor actor 引用
 _stream_thread: Optional[threading.Thread] = None
+# 串行化「SSE 线程对 world 的只读 RPC」与「实验线程对 actor 的销毁」：二者并发调用
+# 同一 carla.Client，在 Windows 上会触发 "streaming client: connection failed" 的
+# Fatal 级 abort（进程级崩溃）。teardown 期间持锁，SSE 线程非阻塞抢锁失败则跳帧。
+_stream_io_guard = threading.Lock()
 
 
 def _start_stream_thread():
