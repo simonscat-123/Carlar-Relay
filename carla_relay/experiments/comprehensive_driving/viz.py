@@ -77,8 +77,8 @@ def render_bbox_frame(rgb_arr, inst_arr, actors):
             xmin, ymin, xmax, ymax = xmin * sx, ymin * sy, xmax * sx, ymax * sy
             name, color = BBOX_CLASSES.get(actor.semantic_tags[0], ("目标", (85, 170, 255)))
             draw.rectangle([xmin, ymin, xmax, ymax], outline=color, width=3)
-            # 标签：类别色底 + 白字（同官方 visualize_2d_bboxes 的渲染方式），附距离
-            label = f"{name} {dist:.1f}m"
+            # 标签：类别色底 + 白字（同官方 visualize_2d_bboxes 的渲染方式），附 id 与距离
+            label = f"#{actor.id} {name} {dist:.1f}m"
             tw = draw.textlength(label, font=font)
             ty = ymin - th - 10
             if ty < 0:
@@ -110,7 +110,8 @@ def render_perceived_frame(rgb_arr, perceived, inst_w, inst_h):
         xmin, ymin, xmax, ymax = xmin * sx, ymin * sy, xmax * sx, ymax * sy
         name, color = EXP10_PERC_STYLE.get(p["cls"], ("目标", (85, 170, 255)))
         draw.rectangle([xmin, ymin, xmax, ymax], outline=color, width=2)
-        label = f"{name}"
+        # 标签含目标 id，便于与障碍物列表/表格的同一对象对应
+        label = f"#{p.get('id', '')} {name}"
         tw = draw.textlength(label, font=font)
         ty = ymin - th - 6
         if ty < 0:
