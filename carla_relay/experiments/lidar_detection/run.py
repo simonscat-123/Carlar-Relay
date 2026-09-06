@@ -258,6 +258,9 @@ def _run_exp04(args):
         # --- 主循环 ---
         total_ticks = int(duration / fixed_delta)
         rows = []
+        # 障碍列表/采集推送的上一次点云帧号：仅当又一整圈点云刷新(full scan)时才推送，
+        # 使障碍更新速率与点云转速一致（低转速时列表按转速刷新，不再按固定 5Hz 刷新）
+        last_push_scan_frame = -1
         # 实验起始基准：CARLA world 的 elapsed_seconds 是会话累计时间（含此前其他实验），
         # 这里取主循环首个 tick 作为 t=0，后续全部转成相对本实验的相对时间
         t0 = None
@@ -295,8 +298,12 @@ def _run_exp04(args):
                 "nearest_obstacle_type": _lidar_tag_name(latest_lidar.get("tag", 0)),
             })
 
-            # 每 4 tick 推一次轨迹点（降低 SSE 频率），携带进度 + 三目投影 + 雷达点云
-            if tick_idx % 4 == 0:
+            # 障碍更新速率与点云转速一致：仅当攒满一整圈新点云时才推送轨迹（携带进度 + 三目投影 + 雷达点云）。
+            # 转速 ≥ 5Hz 时一圈 ≤ 4 tick → 退化为每 4 tick 推一次（低 SSE 频率，数据每 5Hz 刷新一次）；
+            # 转速 < 5Hz（如 1Hz）时一圈所需 tick > 4 → 每圈只推一次，障碍列表按转速刷新。
+            cur_scan_frame = latest_lidar.get("frame", -1)
+            if tick_idx % 4 == 0 and cur_scan_frame != last_push_scan_frame:
+                last_push_scan_frame = cur_scan_frame
                 lidar_pts = latest_lidar.get("points", None)
                 # 雷达面板点云（降采样到 ~1000 点，前端画俯视图用；点数随 PPS 变化，密度差异可见）
                 radar_list = []
