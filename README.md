@@ -53,20 +53,6 @@ server/                          # 分发本目录即可
 └── local_runner/               # 命令行 + pygame 纯体验仿真客户端（不依赖 carla 模块）
 ```
 
-### 关键机制
-
-- **引导壳 + 片段加载**：`experiments/` 与 `world_api/` 内的 `.py` 为命名空间片段，
-  由引导壳按「其余实验 → world\_api → 综合驾驶」的顺序经 `load_into(globals())`
-  以 `exec` 载入原命名空间执行。**这些片段不可独立 import。** 片段命名对齐前端
-  仿真关卡（localization / lidar-detection / semantic-segmentation /
-  comprehensive-driving），URL 中的数字实验 ID 为 API 契约。
-
-- **蓝图动态访问全局态**：`routes/` 蓝图经 `app.extensions["legacy"]` 在请求期
-  读写引导壳的全局变量（world / 帧缓存 / stream 目标等）。
-
-- **双入口等价**：`python -m carla_relay` 与直接运行
-  `python carla_relay_core.py`（均需在 server/ 目录下）行为一致，CLI 参数相同。
-
 ## 依赖项
 
 | 依赖                | 说明                                                                                                                 |
@@ -166,47 +152,3 @@ python -m local_runner <slug> --relay http://127.0.0.1:5000
 # 查看可用的实验与参数文件路径
 python -m local_runner --list
 ```
-
-### 交互与结果
-
-- **综合驾驶**进入后先弹出鸟瞰图（实拍整城俯瞰底图 `/map/render` + 单应性投影校准）：
-  左键点选起点 → 左键点选终点，点完自动调用全局路线规划并开始自动驾驶；
-  右键或 `R` 重置点选。运行阶段左侧车顶俯瞰画面叠加车道高亮 / 参考路线（蓝）/
-  预测轨迹（橙虚线）/ 障碍物（红块），与前端一致。
-
-- 画面下方为**实时统计图**（pygame 折线图，对齐前端 ECharts）：定位/横向误差曲线、
-  轨迹图、语义类别占比、LiDAR 障碍距离与点数、综合驾驶速度/误差/轨迹等。
-
-- 实验进行中按 `ESC` 或关闭窗口即停止实验并把当前进度落盘。
-
-- 实验**正常结束 / 停止 / 出错**都会自动把完整记录（入参、起止时间、状态、
-  `result`/`report` 结果）写入
-  `experiment_params/output/<时间戳>_<实验名>.json`，控制台同步打印保存路径。
-
-- 无窗口联调（dummy 视频驱动，自动跑完并校验结果落盘）：
-  `python -m local_runner.e2e_test localization 10`
-
-## 回归验证（修改代码后建议执行）
-
-```bash
-cd server/
-
-# 1) 路由清单对比（65 条业务路由，防路由增删改）
-python tools/route_snapshot.py check
-
-# 2) 单元测试（SSE hub / 传感器装配 / 语义解析，无需 CARLA 环境）
-python -m pytest tests -q        # 或使用任意 pytest 风格运行器
-
-# 3) 冒烟基线（多端点响应 + 关键全局快照，需要能 import 引导壳）
-python tools/p4_smoke_baseline.py p4_smoke.json
-```
-
-## 开发说明
-
-- 修改 `experiments/` 或 `world_api/` 片段时注意：片段在引导壳命名空间中执行，
-  模块级语句（全局变量、`@app.route` 注册）的书写位置需保持加载顺序语义
-  （综合驾驶片段依赖 world\_api 之后的命名空间状态）。
-
-- 演进方向：在真机 CARLA 验证基础上，将各片段逐步重构为
-  `ExperimentRunner` + `AppContext` 形态，最终移除 `public/` 下的引导壳。
-
