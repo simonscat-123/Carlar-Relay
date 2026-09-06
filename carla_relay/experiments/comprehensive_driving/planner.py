@@ -80,7 +80,7 @@ class TrajectoryPlanner:
         self._nudge_active = False     # 上一帧是否贴边绕行中——空隙门槛滞回用
         self._nudge_prev = False      # 上一帧最优解是否 nudge——开始/结束事件检测用
         # nudge 承诺锁存：(t, 最近一次 _find_nudge 成功结果)。绕行中途空隙
-        # 判定瞬时空转时沿用，防候选闪断 → 兜底刹停 → 死锁振荡（见 step()）
+        # 判定瞬时空转时复用，防候选闪断 → 兜底刹停 → 死锁振荡（见 step()）
         self._nudge_last = None
         # 意图失效降级状态（修死锁，见 INTENT_FAIL_N 注释）
         self._intent_fail_cnt = 0     # intent 候选连续无幸存帧数
@@ -374,7 +374,7 @@ class TrajectoryPlanner:
         if _blocked and intent_l == 0.0:
             nudge = self._find_nudge(obstacles, ego_s, ego_l, v_long, l_min, l_max)
             # 承诺锁存（防御）：绕行中途（已离开本道）空隙判定瞬时空转时，
-            # 沿用 1.5s 内的上一帧剖面——速度/定位噪声让 nudge 候选闪断会
+            # 复用 1.5s 内的上一帧剖面——速度/定位噪声让 nudge 候选闪断会
             # 触发兜底刹停 → 死锁振荡。安全性仍由逐点碰撞硬约束兜底
             if nudge is not None:
                 self._nudge_last = (t, nudge)
@@ -515,8 +515,7 @@ class TrajectoryPlanner:
                             if s_stop - s_prev <= max(0.25, v_prev * DT_PLAN):
                                 v_k = 0.0
                     s_k = s_prev + 0.5 * (v_prev + v_k) * DT_PLAN
-                    # 横向：先算 s 再取 l（nudge 剖面是 s 的函数；车道级
-                    # 候选是时间基五次多项式，结果与原先一致）
+                    # 横向：先算 s 再取 l（nudge 剖面是 s 的函数；车道候选为时间基五次多项式）
                     if lat_fn is not None:
                         l_k = lat_fn(s_k)
                     else:
@@ -526,7 +525,7 @@ class TrajectoryPlanner:
                     # 硬约束①：可行驶域（越界即逆行/出路缘，整条拒绝）。
                     # 逐点取「当地」边界——轨迹展开 30m+，前方路段可能收窄/
                     # 变两车道，只用车头处边界会放行前方的对向车道（蓝线逆行）。
-                    # 借道候选例外：不受同向域限制，改为逐点地图级校验
+                    # 借道候选例外：不受同向域限制，走逐点地图级校验
                     # （Driving 路面即可，不限方向）——对向道/邻接链断裂处
                     # 按此放行，但出路缘仍拒绝。nudge 候选走常规同向域校验
                     # （空隙本就在可行驶域内，含路缘余量）
@@ -543,7 +542,7 @@ class TrajectoryPlanner:
                             b_k = (l_min, l_max)
                         if (l_k < min(b_k[0] + self._ego_half_w + COLL_L, ego_l - 0.05)
                                 or l_k > max(b_k[1] - self._ego_half_w - COLL_L, ego_l + 0.05)):
-                            # 过渡段域错位兜底（修绕行振荡死锁，实测根因）：
+                            # 过渡段域错位兜底：
                             # S 式换道过渡处参考线已切到新车道中心，缓存域边界
                             # 相对「当地车道中心」计量，而 l_k 相对「连续参考
                             # 曲线」——两坐标系在过渡段错位可达数米，逐点比较
@@ -849,9 +848,8 @@ class TrajectoryPlanner:
                     front_obstacle = d_rear
                     front_obs_src = o["cls"]
 
-        # 黄灯：软约束兜底——仅当感知层未提供黄灯停驻点时生效（perception_v2
-        # 红/黄统一输出停驻点，走上方常规停驻剖面；legacy 感知黄灯无停驻点，
-        # 保留旧行为）
+        # 黄灯：软约束兜底——仅当感知层未提供黄灯停驻点时生效（趋近停驻点
+        # 时施加缓制动）
         YELLOW_D = 1.0
         if (tl_state == "yellow" and red_stop_s is None
                 and a_need < YELLOW_D):

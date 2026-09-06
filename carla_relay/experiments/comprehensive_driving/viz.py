@@ -138,8 +138,8 @@ def render_bbox_overlay(inst, rgb_raw, instance_raw, perception_on, perceived,
             _ih = int(inst.attributes["image_size_y"])
             _iw = int(inst.attributes["image_size_x"])
             # 调试：透出 2D 检测框的归一化坐标（相对 inst 帧，imgW/imgH 各是
-            # 该相机宽高；前端按与 3D segs 相同的 drawW/drawH 映射到画布，即可与
-            # 3D 虚线框屏幕坐标直接对比，用于定位"2D 对、3D 偏"的尺寸/基准错位）。
+            # 该相机宽高；前端按与 3D segs 相同的 drawW/drawH 映射到画布，用于
+            # 定位"2D 对、3D 偏"的尺寸/基准错位）。
             # 仅感知闭环感知到目标时下发；真值模式需实例解码，暂不提供（保持 []）。
             diag["uv2d"] = []
             if perception_on:
@@ -714,7 +714,7 @@ def overlay_3d_boxes(*, vehicle, fused_loc, fused_yaw_deg, obstacles, reference,
                         continue
                     segs.append([[a[0] / w, a[1] / h],
                                  [b[0] / w, b[1] / h]])
-                # 单帧诊断：对比自车框 vs 障碍框的「世界坐标 / 投影 uv」，判定偏移
+                # 单帧诊断：记录自车框与障碍框的「世界坐标 / 投影 uv」，判定偏移
                 # 在数据侧(world 重建)还是前端绘制侧(uv→画布映射)。只打前几帧。
                 if _BOX_DBG["n2"] < 20 and segs:
                     _BOX_DBG["n2"] += 1
@@ -736,8 +736,8 @@ def overlay_3d_boxes(*, vehicle, fused_loc, fused_yaw_deg, obstacles, reference,
                     _px_boxes.append({
                         "pixels": pixels, "edges": edges,
                         "color": rec["color"], "dashed": rec["dashed"]})
-            # 后端把 3D 线框烧进 bbox 帧再写回推流（与前端原先 drawBbox3d 同一投影
-            # 数据，仅改为在服务端刻进 JPEG）；bird 保持原始俯瞰帧，由 bake_bird_overlay 烧。
+            # 后端把 3D 线框烧进 bbox 帧再写回推流（在服务端将投影线框刻进 JPEG）；
+            # bird 保持原始俯瞰帧，由 bake_bird_overlay 烧。
             if write_back:
                 try:
                     if _px_boxes and inst_frame:

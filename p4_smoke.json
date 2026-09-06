@@ -76,14 +76,14 @@
    "body": "{\"message\":\"no frame yet or sensor not found\",\"status\":\"error\"}\n"
   },
   {
-   "req": "POST /experiment/5/level {\"level\": \"L9\"}",
-   "status": 400,
-   "body": "{\"current\":\"L2\",\"message\":\"\\u672a\\u77e5\\u7b49\\u7ea7: L9\",\"status\":\"error\"}\n"
+   "req": "POST /experiment/5/classes {\"classes\": \"999\"}",
+   "status": 404,
+   "body": "<!doctype html>\n<html lang=en>\n<title>404 Not Found</title>\n<h1>Not Found</h1>\n<p>The requested URL was not found on the server. If you entered the URL manually please check your spelling and try agai"
   },
   {
-   "req": "POST /experiment/5/level {\"level\": \"L3\"}",
-   "status": 200,
-   "body": "{\"level\":\"L3\",\"message\":\"\\u5df2\\u5207\\u6362\\u5230 L3 \\u8bed\\u4e49\\u5206\\u5272\",\"status\":\"ok\"}\n"
+   "req": "POST /experiment/5/classes {\"classes\": \"22\"}",
+   "status": 404,
+   "body": "<!doctype html>\n<html lang=en>\n<title>404 Not Found</title>\n<h1>Not Found</h1>\n<p>The requested URL was not found on the server. If you entered the URL manually please check your spelling and try agai"
   },
   {
    "req": "POST /experiment/10/params {\"kp_steer\": 0.5, \"perception\": true}",
@@ -124,7 +124,7 @@
  "globals": {
   "stream_vehicle": null,
   "stream_camera": null,
-  "semantic_level": "L3",
+  "semantic_preset": "7",
   "exp10_ctrl": {
    "kp_steer": 0.5,
    "perception": 1.0
