@@ -202,7 +202,7 @@ def render_localization(screen, fonts, surfaces, exp, hist: TelemetryHistory, ct
     lines = [
         f"进度 {pt.get('progress', 0):.0f}% · 时刻 {pt.get('t', 0):.1f}s",
         f"定位误差 {pt.get('error', 0):.2f} m · 横向误差 {pt.get('cte', 0):.2f} m · 转向 {pt.get('steer', 0):.2f}",
-        f"GNSS {'有效' if pt.get('gnss_x') is not None else '无效（INS 推算）'}",
+        f"GNSS {'1 Hz 新样本' if pt.get('gnss_updated', True) else '等待下一次 1 Hz 采样'}",
     ]
     if res:
         lines.insert(0, f"完成 · RMSE {res.get('rmse', '—')} m · 平均横向 {res.get('avg_cte', '—')} m · "

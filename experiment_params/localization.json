@@ -3,15 +3,13 @@
   "label": "定位分析",
   "slug": "localization",
   "relay": "http://127.0.0.1:5000",
-  "describe": "采集车辆轨迹并做 GNSS/INS 互补滤波定位，评估定位与横向误差",
+  "describe": "采集车辆轨迹并做 GNSS/INS 卡尔曼滤波定位，评估定位与横向误差",
   "params": {
     "duration": 30,
     "settle_seconds": 1.5,
     "launch_seconds": 2.0,
     "launch_throttle": 0.25,
-    "alpha": 0.08,
     "gnss_noise": 1.0,
-    "ins_noise": 0.1,
-    "gnss_outage": null
+    "ins_noise": 0.1
   }
 }

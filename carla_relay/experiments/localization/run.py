@@ -3,7 +3,7 @@
 本文件由 carla_relay.experiments.load_into(globals()) 载入执行，不可独立 import。
 """
 # =============================================================================
-# 实验 23（合并实验2+3）：服务端运行完整实验 + 互补滤波，SSE 推送轨迹点
+# 实验 23（合并实验2+3）：服务端运行完整实验 + 卡尔曼滤波，SSE 推送轨迹点
 # =============================================================================
 
 _EXP23_LOCK = threading.Lock()
@@ -13,15 +13,12 @@ _EXP23_THREAD = None
 
 EARTH_RADIUS_M = 6378137.0
 
-# 噪声自适应 alpha 参数（文件头可调）：
-#   NOISE_JITTER          —— 每帧对 IMU/GNSS 噪声标准差施加的比例扰动（±10%），
-#                            使有效噪声逐帧波动，alpha 也随之每帧变化。
-#   ALPHA_MIN / ALPHA_MAX —— alpha 上下限钳制，避免极端 0/1（更信单传感器）导致抖动。
-#   ALPHA_IDLE            —— GNSS/INS 双噪声均≈0 时的中性回退值（此时比值无意义）。
-NOISE_JITTER = 0.10
-ALPHA_MIN = 0.05
-ALPHA_MAX = 0.95
-ALPHA_IDLE = 0.5
+from carla_relay.experiments.localization.fusion import (
+    PositionKalmanFilter2D,
+    SensorFrameGate,
+    YawKalmanFilter,
+    velocity_increment_std,
+)
 
 
 def _llh_to_local(lat, lon, alt, lat0, lon0, alt0):
@@ -75,18 +72,9 @@ def _run_exp23(args):
     gnss_noise = max(0.0, float(args.get("gnss_noise", 0.0)))
     ins_noise = max(0.0, float(args.get("ins_noise", 0.0)))
     seed = int(args.get("seed", 7))
-    # 闭环控制参数（冻结，保证定位噪声是唯一变量）
+    # 闭环控制参数（真值位姿跟踪，定位噪声仅用于评估）
     target_speed = float(args.get("target_speed", 6.0))
     lookahead = float(args.get("lookahead", 6.0))
-    # GNSS 失锁窗口 [开始秒, 结束秒]（相对采集起点），None 表示不失锁
-    outage = args.get("gnss_outage")
-    if isinstance(outage, (list, tuple)) and len(outage) == 2:
-        outage = (float(outage[0]), float(outage[1]))
-    else:
-        outage = None
-    if outage:
-        _exp_log(f"GNSS 失锁窗口: {outage[0]:.0f}s ~ {outage[1]:.0f}s")
-
     actors = []
     sensors = {}  # sid → actor ref
     old_settings = None
@@ -130,7 +118,7 @@ def _run_exp23(args):
 
         # --- 挂载 GNSS ---
         gnss_bp = world.get_blueprint_library().find("sensor.other.gnss")
-        gnss_bp.set_attribute("sensor_tick", str(fixed_delta))
+        gnss_bp.set_attribute("sensor_tick", "1.0")  # GNSS 固定 1 Hz；IMU 保持仿真 tick 频率
         gnss = world.spawn_actor(gnss_bp, carla.Transform(carla.Location(z=1.8)),
                                  attach_to=vehicle)
         actors.append(gnss)
@@ -204,14 +192,20 @@ def _run_exp23(args):
             vehicle.apply_control(carla.VehicleControl(throttle=throttle))
             world.tick()
 
-        # --- 闭环控制（不再使用 TM 自动驾驶：转向/油门由融合估计位姿驱动）---
-        _exp_log("闭环控制已启用（Pure Pursuit + PID），开始采集")
+        # --- 闭环控制：真值位姿跟踪参考路线；定位滤波仅用于实验展示/评估 ---
+        _exp_log("闭环控制已启用（真值位姿 Pure Pursuit + PID；定位误差不参与控制）")
 
-        # --- 互补滤波器（参照 exp03_gnss_ins_filter.py，首帧不跳过）---
+        # --- GNSS/INS 卡尔曼滤波器（首帧不跳过）---
         lat0 = lon0 = alt0 = None
-        ins_x = ins_y = ins_vx = ins_vy = 0.0
+        fused_x = fused_y = 0.0
+        position_filter = PositionKalmanFilter2D(gnss_noise, ins_noise)
+        yaw_filter = None
         gt_ref = None
         last_t = None
+        imu_frame_gate = SensorFrameGate()
+        gnss_frame_gate = SensorFrameGate()
+        latest_gx = latest_gy = None
+        latest_gx_raw = latest_gy_raw = None
         trajectory = []
         total_ticks = int(duration / fixed_delta)
         t0 = None           # 采集起始时刻（世界时间），用于记录相对时间
@@ -229,7 +223,6 @@ def _run_exp23(args):
         offlane_ticks = 0
         trajectory_pushed_route = False
         diag_ticks = 0          # 首帧诊断日志计数
-        diverge_ticks = 0       # 融合发散看门狗计数
 
         for tick_idx in range(total_ticks):
             if _EXP23_ABORT:
@@ -259,16 +252,13 @@ def _run_exp23(args):
             if gnss_data is None or imu_data is None:
                 continue
 
-            # --- 噪声自适应 alpha：对 IMU/GNSS 噪声各施加 ±NOISE_JITTER 扰动（每帧波动），
-            # 再由有效噪声反向加权得到 GNSS 权重 alpha——噪声小的一方获得更高信任。
-            # fused = alpha*GNSS + (1-alpha)*INS，故有效 GNSS 噪声更小→alpha 越大越信 GNSS，
-            # 有效 INS 噪声更小→alpha 越小越信 INS。本帧 gauss 采样与融合均使用该有效噪声。 ---
-            eff_gnss = gnss_noise * (1.0 + rng.uniform(-NOISE_JITTER, NOISE_JITTER))
-            eff_ins = ins_noise * (1.0 + rng.uniform(-NOISE_JITTER, NOISE_JITTER))
-            if eff_gnss + eff_ins < 1e-9:
-                alpha = ALPHA_IDLE
-            else:
-                alpha = max(ALPHA_MIN, min(ALPHA_MAX, eff_ins / (eff_gnss + eff_ins)))
+            # 传感器缓存保存最新值：IMU 同一帧不得重复积分；GNSS 同一帧不得重复
+            # 做观测更新，否则 1 Hz 数据会被误当成 20 Hz 重复使用。
+            imu_frame = imu_data.get("frame")
+            if not imu_frame_gate.accept(imu_frame):
+                continue
+            gnss_frame = gnss_data.get("frame")
+            gnss_is_new = gnss_frame_gate.accept(gnss_frame)
 
             # --- 初始化（首帧不跳过，对齐 exp03：dt=1e-3，从 llh_to_local 零位开始积分）---
             if last_t is None:
@@ -276,7 +266,7 @@ def _run_exp23(args):
                 lat0 = gnss_data["latitude"]
                 lon0 = gnss_data["longitude"]
                 alt0 = gnss_data["altitude"]
-                ins_x = ins_y = ins_vx = ins_vy = 0.0
+                fused_x = fused_y = 0.0
                 last_t = t_sim
                 dt = 1e-3  # 与 exp03 首帧 dt 一致
             else:
@@ -305,8 +295,9 @@ def _run_exp23(args):
             GRAV = 9.81
             g_body = (-GRAV * fwd.z, -GRAV * right.z, -GRAV * up.z)
             acc_meas = imu_data["accelerometer"]
-            ax_body = acc_meas["x"] + g_body[0] + rng.gauss(0, eff_ins)
-            ay_body = acc_meas["y"] + g_body[1] + rng.gauss(0, eff_ins)
+            # IMU 人工误差不再重复注入加速度域；仅作为速度随机游走累加。
+            ax_body = acc_meas["x"] + g_body[0]
+            ay_body = acc_meas["y"] + g_body[1]
             az_body = acc_meas["z"] + g_body[2]
             # 旋转到世界系（完整三轴，含 roll/pitch）
             ax_world = ax_body * fwd.x + ay_body * right.x + az_body * up.x
@@ -322,55 +313,65 @@ def _run_exp23(args):
                          f"{acc_meas['z']:+.2f}) 重力补偿后=({ax_body:+.2f},{ay_body:+.2f}) "
                          f"GNSS=({gnss_data['latitude']:.6f},{gnss_data['longitude']:.6f})")
 
-            # INS 积分（速度限幅防发散）。有效噪声 eff_ins 单位为 m/s（速度测量噪声），
-            # 直接叠加到推算速度上，而非加速度域。
-            ins_vx = max(-25.0, min(25.0, ins_vx + ax_world * dt + rng.gauss(0, eff_ins)))
-            ins_vy = max(-25.0, min(25.0, ins_vy + ay_world * dt + rng.gauss(0, eff_ins)))
-            ins_x += ins_vx * dt
-            ins_y += ins_vy * dt
-
-            # GNSS → 本地坐标（叠加位置噪声模拟定位误差）
-            gx_raw, gy_raw, _ = _llh_to_local(
-                gnss_data["latitude"], gnss_data["longitude"], gnss_data["altitude"],
-                lat0, lon0, alt0,
+            # IMU 人工随机误差直接进入卡尔曼速度预测状态。ins_noise 是速度
+            # 随机游走强度 (m/s/sqrt(s))，sqrt(dt) 离散化保证帧率无关。
+            dv_std = velocity_increment_std(ins_noise, dt)
+            velocity_error_x = rng.gauss(0, dv_std)
+            velocity_error_y = rng.gauss(0, dv_std)
+            position_filter.predict(
+                ax_world, ay_world, dt, ins_noise,
+                velocity_error_x, velocity_error_y,
             )
-            gx = gx_raw + rng.gauss(0, eff_gnss)
-            gy = gy_raw + rng.gauss(0, eff_gnss)
 
-            # GNSS 失锁判定：窗口内无观测，融合退化为纯 INS 推算
-            elapsed_exp = tick_idx * fixed_delta
-            gnss_valid = outage is None or not (outage[0] <= elapsed_exp <= outage[1])
+            # GNSS 固定 1 Hz：只有收到新 GNSS 帧时才生成观测并执行卡尔曼更新。
+            gx = gy = gx_raw = gy_raw = None
+            kf_diag = {
+                "gain_position_x": 0.0, "gain_position_y": 0.0,
+                "gain_velocity_x": 0.0, "gain_velocity_y": 0.0,
+                "innovation_x": None, "innovation_y": None,
+            }
+            if gnss_is_new:
+                gx_raw, gy_raw, _ = _llh_to_local(
+                    gnss_data["latitude"], gnss_data["longitude"], gnss_data["altitude"],
+                    lat0, lon0, alt0,
+                )
+                gx = gx_raw + rng.gauss(0, gnss_noise)
+                gy = gy_raw + rng.gauss(0, gnss_noise)
+                latest_gx, latest_gy = gx, gy
+                latest_gx_raw, latest_gy_raw = gx_raw, gy_raw
+                kf_diag = position_filter.update(gx, gy, gnss_noise)
+            fused_x = position_filter.x.position
+            fused_y = position_filter.y.position
+            gnss_weight = 0.5 * (
+                kf_diag["gain_position_x"] + kf_diag["gain_position_y"]
+            )
+            ins_weight = 1.0 - gnss_weight
 
-            # 互补滤波校正（GNSS 突跳保护：与 INS 相差 >60 m 视为野值，跳过本帧校正）
-            if gnss_valid and math.hypot(gx - ins_x, gy - ins_y) < 60.0:
-                ins_x = (1 - alpha) * ins_x + alpha * gx
-                ins_y = (1 - alpha) * ins_y + alpha * gy
-
-            # --- 航向融合（互补滤波，与位置同构）：INS 陀螺递推 + GNSS 航向观测 ---
+            # --- 航向卡尔曼滤波：INS 陀螺递推 + GNSS 航向观测 ---
             # 陀螺角速度用「真值航向差分」模拟（CARLA IMU 陀螺读数在此环境不可靠，同实验10 的处理）
             if prev_gt_yaw_deg is None:
-                fused_yaw_deg = yaw_deg
+                yaw_filter = YawKalmanFilter(yaw_deg, gnss_noise * 4.0)
+                fused_yaw_deg = yaw_filter.angle_deg
                 prev_gt_yaw_deg = yaw_deg
+                gnss_yaw_deg = yaw_deg
+                yaw_gain = 0.0
             else:
                 delta_yaw = ((yaw_deg - prev_gt_yaw_deg + 180.0) % 360.0) - 180.0
                 prev_gt_yaw_deg = yaw_deg
-                gyro_w = delta_yaw / dt + rng.gauss(0, eff_ins * 30.0)   # °/s
-                ins_yaw_deg = fused_yaw_deg + gyro_w * dt
-                if gnss_valid:
-                    gnss_yaw_deg = yaw_deg + rng.gauss(0, eff_gnss * 4.0)  # 度
-                    # 用卷绕后的相位差(innovation)做互补滤波，避免 ±180° 边界跳变
-                    innov_deg = ((gnss_yaw_deg - ins_yaw_deg + 180.0) % 360.0) - 180.0
-                    fused_yaw_deg = ins_yaw_deg + alpha * innov_deg
-                else:
-                    fused_yaw_deg = ins_yaw_deg
-                fused_yaw_deg = ((fused_yaw_deg + 180.0) % 360.0) - 180.0
+                gyro_std = ins_noise * 30.0
+                gyro_w = delta_yaw / dt + rng.gauss(0, gyro_std)   # °/s
+                yaw_filter.predict(gyro_w, dt, gyro_std)
+                yaw_gain = 0.0
+                if gnss_is_new:
+                    gnss_yaw_deg = yaw_deg + rng.gauss(0, gnss_noise * 4.0)  # 度
+                    yaw_gain, _yaw_innovation = yaw_filter.update(
+                        gnss_yaw_deg, gnss_noise * 4.0
+                    )
+                fused_yaw_deg = yaw_filter.angle_deg
 
-            # --- 闭环控制：Pure Pursuit 只吃融合估计位姿，真值严禁流入控制 ---
-            fused_tform = carla.Transform(
-                carla.Location(x=ins_x + gt_ref[0], y=ins_y + gt_ref[1], z=loc.z),
-                carla.Rotation(yaw=fused_yaw_deg),
-            )
-            steer, wp_idx, _ = _pure_pursuit_steer(fused_tform, route_wps, lookahead, wp_idx)
+            # 定位误差仅用于展示与误差统计；控制使用 CARLA 真值位姿，
+            # 避免定位噪声直接变成方向盘左右抖动。
+            steer, wp_idx, _ = _pure_pursuit_steer(ego_tf, route_wps, lookahead, wp_idx)
             vel = vehicle.get_velocity()
             speed = math.sqrt(vel.x ** 2 + vel.y ** 2 + vel.z ** 2)
             throttle, brake, pid_prev_err, pid_integral = _pid_speed_control(
@@ -387,20 +388,7 @@ def _run_exp23(args):
                     steer_reversals += 1
                 prev_steer_sign = steer_sign
 
-            err = math.hypot(ins_x - gt_x_local, ins_y - gt_y_local)
-
-            # 融合发散看门狗（安全联锁：真值仅用于检测，控制仍只吃融合位姿）。
-            # 冷启动等异常导致 INS 严重发散时，把融合位姿重置到当前 GNSS 观测，
-            # 避免车辆持续满舵偏驶。
-            if err > 15.0:
-                diverge_ticks += 1
-            else:
-                diverge_ticks = 0
-            if diverge_ticks >= 10 and gnss_valid:
-                _exp_log(f"融合发散保护触发（err={err:.1f}m），重置到 GNSS 观测")
-                ins_x, ins_y = gx, gy
-                ins_vx = ins_vy = 0.0
-                diverge_ticks = 0
+            err = math.hypot(fused_x - gt_x_local, fused_y - gt_y_local)
 
             # 真值横向偏差（评分用，不参与控制）：投影到最近路线段
             cte_gt = _route_cte(route_wps, wp_idx, loc.x, loc.y)
@@ -412,12 +400,13 @@ def _run_exp23(args):
             # 推送到 SSE（t 为相对采集起点的相对时间）
             point = {
                 "t": round(t_sim - t0, 2),
-                "gnss_x": round(gx, 3) if gnss_valid else None,
-                "gnss_y": round(gy, 3) if gnss_valid else None,
-                "gnss_x_raw": round(gx_raw, 3),
-                "gnss_y_raw": round(gy_raw, 3),
-                "fused_x": round(ins_x, 3),
-                "fused_y": round(ins_y, 3),
+                # 1 Hz GNSS 采用零阶保持供轨迹展示；gnss_updated 指示本帧是否更新。
+                "gnss_x": round(latest_gx, 3) if latest_gx is not None else None,
+                "gnss_y": round(latest_gy, 3) if latest_gy is not None else None,
+                "gnss_x_raw": round(latest_gx_raw, 3) if latest_gx_raw is not None else None,
+                "gnss_y_raw": round(latest_gy_raw, 3) if latest_gy_raw is not None else None,
+                "fused_x": round(fused_x, 3),
+                "fused_y": round(fused_y, 3),
                 "gt_x": round(gt_x_local, 3),
                 "gt_y": round(gt_y_local, 3),
                 "ins_accel_x": round(ax_body, 3),
@@ -427,7 +416,24 @@ def _run_exp23(args):
                 "steer": round(steer, 3),
                 "cte": round(cte_gt, 3),
                 "error": round(err, 3),
-                "alpha": round(alpha, 3),
+                # alpha 保留为兼容字段，语义为当前卡尔曼位置增益。
+                "alpha": round(gnss_weight, 3),
+                "gnss_weight": round(gnss_weight, 3),
+                "ins_weight": round(ins_weight, 3),
+                "kalman_position_std": round(math.sqrt(
+                    0.5 * (position_filter.x.position_variance
+                           + position_filter.y.position_variance)
+                ), 3),
+                "kalman_velocity_x": round(position_filter.x.velocity, 3),
+                "kalman_velocity_y": round(position_filter.y.velocity, 3),
+                "kalman_yaw_gain": round(yaw_gain, 3),
+                "innovation_x": (round(kf_diag["innovation_x"], 3)
+                                 if kf_diag["innovation_x"] is not None else None),
+                "innovation_y": (round(kf_diag["innovation_y"], 3)
+                                 if kf_diag["innovation_y"] is not None else None),
+                "ins_velocity_error_x": round(velocity_error_x, 4),
+                "ins_velocity_error_y": round(velocity_error_y, 4),
+                "gnss_updated": gnss_is_new,
             }
             trajectory.append(point)
 

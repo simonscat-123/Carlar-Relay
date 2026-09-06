@@ -211,7 +211,7 @@ class TelemetryHistory:
                     "定位误差": pt.get("error"), "横向误差": pt.get("cte")})
                 self.exp23_traj.append("真值", pt.get("gt_x"), pt.get("gt_y"))
                 self.exp23_traj.append("融合", pt.get("fused_x"), pt.get("fused_y"))
-                if pt.get("gnss_x") is not None:
+                if pt.get("gnss_updated", True) and pt.get("gnss_x") is not None:
                     self.exp23_traj.append("GNSS", pt.get("gnss_x"), pt.get("gnss_y"))
         elif exp_id == 4:
             pt = exp.get("trajectory")
