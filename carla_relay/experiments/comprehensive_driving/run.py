@@ -710,9 +710,11 @@ def _run_exp10(args):
                 _exp_log("到达终点")
                 break
 
-            # 语义分割帧：原始 CityScapes 标签 → 彩色图写入帧缓存（SSE 推流用）
-            render_semantic_frame(sem, _semantic_raw, _sensor_frames, _sensor_frame_num,
-                                  _label_semantic_classes, _colors_from_labels)
+            # 语义分割帧：原始 CityScapes 标签 → 彩色图写入帧缓存（SSE 推流用）。
+            # 与感知实验一致，用精细 22 类预设：借助实例分割帧反查 actor 类别细分动态目标。
+            render_semantic_frame(sem, inst, _semantic_raw, _instance_raw,
+                                  _sensor_frames, _sensor_frame_num,
+                                  _label_semantic_classes, _colors_from_labels, world)
 
             # 推送实验数据（可视化层组装：鸟瞰车道/参考线/预测轨迹 + 状态帧）
             # 障碍两侧可通行间隙带（口径与 simple_planner 一致 → 所见即决策）。

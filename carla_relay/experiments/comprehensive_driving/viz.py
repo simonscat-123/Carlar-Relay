@@ -770,17 +770,30 @@ def overlay_3d_boxes(*, vehicle, fused_loc, fused_yaw_deg, obstacles, reference,
     return out
 
 
-def render_semantic_frame(sem, semantic_raw, sensor_frames, sensor_frame_num,
-                          label_semantic_classes, colors_from_labels):
+def render_semantic_frame(sem, inst, semantic_raw, instance_raw, sensor_frames,
+                          sensor_frame_num, label_semantic_classes,
+                          colors_from_labels, world, preset="22"):
     """语义分割帧：原始 CityScapes 标签 → 彩色图写入帧缓存，供 SSE 推流
-    （前端可在相机视角下拉切到语义画面；未连接/无帧时前端回退 Mock）。"""
-    if sem.id in semantic_raw:
+    （前端可在相机视角下拉切到语义画面；未连接/无帧时前端回退 Mock）。
+
+    分类与感知实验一致，默认使用精细的 22 类预设：动态参与者（车辆/行人等）
+    需借助实例分割帧反查 actor 类别细分（轿车/卡车/公交/行人…），否则动态
+    目标会落入未标注大类。"""
+    if sem.id in semantic_raw and (preset == "7" or inst.id in instance_raw):
         try:
             sem_h = int(sem.attributes["image_size_y"])
             sem_w = int(sem.attributes["image_size_x"])
             sem_arr = np.frombuffer(semantic_raw[sem.id], dtype=np.uint8).reshape((sem_h, sem_w, 4))
             sem_labels = sem_arr[:, :, 2].astype(np.int32)
-            sem_rgb = colors_from_labels(label_semantic_classes(sem_labels, "7"), "7")
+            # 22 类动态细分：用实例分割帧（R=actor 高字节, G=actor 低字节）反查 actor 类别
+            instance = None
+            if preset == "22" and inst.id in instance_raw:
+                ins_arr = np.frombuffer(instance_raw[inst.id], dtype=np.uint8).reshape((sem_h, sem_w, 4))
+                sem_ids = ins_arr[:, :, 2].astype(np.int32)
+                actor_ids = ins_arr[:, :, 1].astype(np.uint16) + (ins_arr[:, :, 0].astype(np.uint16) << 8)
+                instance = (sem_ids, actor_ids)
+            sem_rgb = colors_from_labels(
+                label_semantic_classes(sem_labels, preset, instance, world), preset)
             sem_buf = io.BytesIO()
             PIL.Image.fromarray(sem_rgb, mode="RGB").save(sem_buf, format="JPEG", quality=85)
             sensor_frames[sem.id] = sem_buf.getvalue()

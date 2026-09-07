@@ -36,6 +36,7 @@ from carla_relay.experiments.comprehensive_driving.viz import render_perceived_f
 
 import math as _math5
 import random as _random5
+import time as _time5
 
 
 def _exp5_weather_prof(key):
@@ -355,6 +356,13 @@ _EXP05_THREAD = None
 _EXP05_LOCK = threading.Lock()
 
 
+def _perf5_accum(perf, key, dt):
+    """perf: {key: [total_ms, count]} —— 就地累加单阶段耗时（计时桩用）。"""
+    rec = perf.setdefault(key, [0.0, 0])
+    rec[0] += max(0.0, dt) * 1000.0
+    rec[1] += 1
+
+
 def _run_exp05(args):
     global _EXP05_RUNNING, _EXP05_ABORT, _EXP_CURRENT_ID, _stream_camera, _stream_vehicle, _stream_semantic
     _EXP_CURRENT_ID = 5
@@ -565,6 +573,8 @@ def _run_exp05(args):
         _exp_log("自动驾驶已启用，开始采集")
 
         total = int(duration / fixed_delta)
+        perf5 = {}   # 计时桩：{stage: [累计ms, 调用次数]}，每 40 帧打印一次
+        render_counts5 = {"rgb": 0, "dep": 0, "sem": 0}
         # 实验相对时间：以首采集帧的 CARLA 世界时间为 0 起点，
         # 避免把世界时钟（服务启动累计秒）误当成实验耗时
         anchor_t = None
@@ -572,7 +582,10 @@ def _run_exp05(args):
         for i in range(total):
             if _EXP05_ABORT:
                 break
+            _t5 = _time5.perf_counter()
             world.tick()
+            _perf5_accum(perf5, "tick/渲染+仿真", _time5.perf_counter() - _t5)
+            _t5 = _time5.perf_counter()
             snap = world.get_snapshot()
             t = snap.timestamp.elapsed_seconds
             if anchor_t is None:
@@ -599,6 +612,7 @@ def _run_exp05(args):
             rich = {}   # 障碍 id -> 真实 actor 补齐的 pose/size/运动学
             if ins.id in _instance_raw and sem.id in _semantic_raw:
                 try:
+                    _t5 = _time5.perf_counter()
                     ih = int(ins.attributes["image_size_y"]); iw = int(ins.attributes["image_size_x"])
                     sh = int(sem.attributes["image_size_y"]); sw = int(sem.attributes["image_size_x"])
                     inst_arr = np.frombuffer(_instance_raw[ins.id], dtype=np.uint8).reshape((ih, iw, 4))
@@ -609,41 +623,48 @@ def _run_exp05(args):
                     # 天气 → 识别降级：恶劣天对远目标随机漏检（近处保留）。
                     # 漏检后的 target 同步喂给 BEV/决策/障碍表 → 感知退化的世界是自洽的。
                     targets = _exp5_degrade_detection(targets, weather_key, weather_rng)
-                    # BEV 动态障碍统一口径：目标检测到（融合范围内）就绘制上 BEV，
-                    # 只受 bev 栅格自身覆盖半径裁剪；不再受 depth_range 二次门控。
-                    # 车道/可行驶等静态结构仍来自语义分割、受 semantic_range 截断。
                     cells, bev_payload = bev.build(sem_labels, targets,
                                                    sem_h=sh, sem_w=sw)
                     decision = planner.decide(cells, res=bev.res)
+                    _perf5_accum(perf5, "感知融合+BEV+规划", _time5.perf_counter() - _t5)
                     # 前视 RGB：真实世界天气直接作用在该相机帧上 → 叠加抖动后的检测框。
                     # 画面即 CARLA 原图；识别几何仍以漏检后 targets 为准。
                     if cam.id in _exp5_rgb_raw:
+                        _t5 = _time5.perf_counter()
                         rcw, rch = int(cam.attributes["image_size_x"]), int(cam.attributes["image_size_y"])
                         _rgb_arr = np.frombuffer(_exp5_rgb_raw[cam.id], dtype=np.uint8).reshape((rch, rcw, 4))
                         _disp = _exp5_jitter_box(targets, weather_key, weather_rng)
                         _sensor_frames[cam.id] = _exp5_render_perceived(_rgb_arr, _disp, iw, ih)
                         _sensor_frame_num[cam.id] = _sensor_frame_num.get(cam.id, 0) + 1
+                        render_counts5["rgb"] += 1
+                        _perf5_accum(perf5, "RGB渲染+JPEG编码", _time5.perf_counter() - _t5)
                 except Exception as _exp5e:
                     _exp_log(f"感知融合异常: {_exp5e!r}")
 
             # 障碍物 rich 信息：反查真实 actor 补齐 pose/size/速度/加速度
+            _t5 = _time5.perf_counter()
             for _tg in targets:
                 _d5 = _exp5_actor_metrics(world, vehicle, _tg.get("id"), t, _exp5_vel_state)
                 if _d5 is None:
                     # actor 反查失败：尺寸回退感知估计（不再显示 0）
                     _d5 = _exp5_fallback_size(vehicle, _tg)
                 rich[_tg.get("id")] = _d5
+            _perf5_accum(perf5, "actor_metrics(RPC)", _time5.perf_counter() - _t5)
 
             # 深度相机画面：按 depth_range 对数灰度 + 截断（超距置黑）
             if dep.id in _exp5_depth_raw:
                 try:
+                    _t5 = _time5.perf_counter()
                     _sensor_frames[dep.id] = _exp5_depth_gray_jpeg(
                         _exp5_depth_raw[dep.id], 600, 800, depth_range)
                     _sensor_frame_num[dep.id] = _sensor_frame_num.get(dep.id, 0) + 1
+                    render_counts5["dep"] += 1
+                    _perf5_accum(perf5, "深度灰度+JPEG编码", _time5.perf_counter() - _t5)
                 except Exception:
                     pass
 
             if sem_labels is not None:
+                _t5 = _time5.perf_counter()
                 labeled = _label_semantic_classes(sem_labels, classes, instance, world)
                 rgb = _colors_from_labels(labeled, classes)
                 # 语义画面退化：按深度真值做距离感知退化（模糊/雾屏/噪声），近清远浊；
@@ -662,6 +683,18 @@ def _run_exp05(args):
                 img.save(buf, format="JPEG", quality=85)
                 _sensor_frames[sem.id] = buf.getvalue()
                 _sensor_frame_num[sem.id] = i + 1
+                render_counts5["sem"] += 1
+                _perf5_accum(perf5, "语义着色+退化+JPEG", _time5.perf_counter() - _t5)
+
+            # ── 计时桩：每 40 帧打印一次各阶段平均/占比，用于定位“渲染 vs 计算” ──
+            if i and i % 40 == 0:
+                _tick_ms = perf5.get("tick/渲染+仿真", [0.0, 0])
+                _per_tick = (_tick_ms[1] and _tick_ms[0] / _tick_ms[1]) or 0.0
+                _segs = " ".join(
+                    f"{k}={(v[0]/v[1]):.1f}ms" for k, v in sorted(
+                        perf5.items(), key=lambda kv: -kv[1][0]))
+                _exp_log(f"[PERF i={i}] 每帧≈{_per_tick:.1f}ms "
+                         f"(渲染={render_counts5['rgb']} 深度={render_counts5['dep']} 语义={render_counts5['sem']}) | {_segs}")
 
             if i % 4 == 0:
                 pt = {"frame": i + 1, "t": round(rel_t, 3), "progress": round((i + 1) / total * 100, 1), "classes": classes,
