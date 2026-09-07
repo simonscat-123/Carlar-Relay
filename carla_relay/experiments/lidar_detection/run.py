@@ -48,8 +48,12 @@ def _run_exp04(args):
     fixed_delta = float(args.get("fixed_delta", 0.05))
     lidar_range = float(args.get("range", 60.0))
     lidar_channels = int(args.get("channels", 64))
-    lidar_pps = int(args.get("points_per_second", 120000))
     lidar_rf = float(args.get("rotation_frequency", 20.0))
+    # 每线每圈点数 (PLPR)：与前端一致，作为直接输入项；采样率(PPS) = 通道数 × 转速 × PLPR 派生
+    plpr_input = int(args.get("plpr", 0))
+    lidar_pps = int(lidar_channels * lidar_rf * plpr_input) \
+        if (plpr_input > 0 and lidar_channels > 0 and lidar_rf > 0) \
+        else int(args.get("points_per_second", 120000))
     # 每圈 tick 数 = 仿真频率 ÷ 转速（前端滑条为整数比档位，直接取整即为精确值）
     ticks_per_scan = max(1, round((1.0 / fixed_delta) / lidar_rf)) if lidar_rf > 0 else 1
     lidar_hfov = float(args.get("lidar_hfov", 120.0))  # LiDAR 水平视场角
