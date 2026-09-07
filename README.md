@@ -1,12 +1,8 @@
-# CARLA 中继网关（carla\_relay）
+# CARLA_Relay
 
-CARLA 仿真器的 HTTP + SSE 中继服务：向前端页面暴露 REST API（车辆控制、传感器数据、
-实验流程）与 SSE 实时流（相机画面、车辆状态），并承载自动驾驶教学实验的完整逻辑
-（感知 / 定位 / 规划 / 控制）。
+CARLA HTTP + SSE 中继服务,承载自动驾驶教学实验的完整逻辑（感知 / 定位 / 规划 / 控制）。
 
 ## 整体架构
-
-服务核心（引导壳 + 模块化包）全部位于 `server/` 目录内，**只分发** **`server/`** **即可运行**：
 
 ```
 server/                          # 分发本目录即可
@@ -20,7 +16,7 @@ server/                          # 分发本目录即可
 │   ├── core/                   # 核心层
 │   │   ├── carla_client.py     #   CARLA 客户端连接 / 进程管理
 │   │   ├── sensors.py          #   传感器装配与帧序列化
-│   │   └── sse.py              #   SSE 订阅者 hub（满队列踢出防画面定格）
+│   │   └── sse.py              #   SSE 订阅者 hub
 │   ├── perception/             # 感知层
 │   │   └── semantics.py        #   语义分割标签解析
 │   ├── routes/                 # 路由蓝图（Flask Blueprint）
@@ -39,18 +35,17 @@ server/                          # 分发本目录即可
 │   │   ├── semantic_segmentation/  #   语义分割 · 前端关卡 semantic-segmentation（实验ID 5）
 │   │   ├── comprehensive_driving/  #   综合驾驶 · 前端关卡 comprehensive-driving（实验ID 10）：
 │   │   │   └── ...             #     分层真实模块（frames/planner/control/...）
-│   │   │                       #     + run.py 薄编排片段（主循环 / 障碍物 / 路由）
 │   │   └── <历史实验>/run.py   #   历史实验：basic_control / gnss_imu / ins_fusion /
 │   │                           #   lidar_camera_projection / route_planning /
-│   │                           #   path_following / target_navigation（前端已不暴露）
+│   │                           #   path_following / target_navigation
 │   └── world_api/              # 世界查询/管理 API（命名空间片段）
 │       ├── perception.py       #   障碍物 / 信号灯查询 / 路径障碍采样
 │       ├── map_api.py          #   出生点 / 边界 / 路网 / 地图渲染
 │       └── actors_api.py       #   行人生成 / 俯瞰视角
 ├── tests/                      # 单元测试（SSE / 传感器 / 语义解析）
-├── tools/                      # 回归门禁工具（见下文「回归验证」）
+├── tools/                      # 回归门禁工具
 ├── experiment_params/          # 命令行体验仿真：各实验参数 JSON + output/ 结果目录
-└── local_runner/               # 命令行 + pygame 纯体验仿真客户端（不依赖 carla 模块）
+└── local_runner/               # 命令行 + pygame 纯体验仿真客户端
 ```
 
 ## 依赖项
@@ -152,3 +147,13 @@ python -m local_runner <slug> --relay http://127.0.0.1:5000
 # 查看可用的实验与参数文件路径
 python -m local_runner --list
 ```
+
+## LICENSE
+本项目采用 **知识共享署名‑非商业性使用‑相同方式共享 4.0 国际许可协议（CC BY‑NC‑SA 4.0）**。
+
+✅ 允许行为：下载、学习、Fork、修改、分发本项目，仅限用于学习、研究等非商业用途。
+❌ 禁止行为：禁止任何形式的商业使用，包括但不限于售卖、集成到商业产品、付费服务、广告场景。
+⚠️ 衍生作品约束：如果你分发修改后的衍生项目，必须继续使用本协议，保留原作者署名。
+
+完整法律协议详见仓库根目录 `LICENSE` 文件（以英文官方文本为法律依据）。
+协议官网：https://creativecommons.org/licenses/by‑nc‑sa/4.0/legalcode
