@@ -101,12 +101,10 @@ curl http://127.0.0.1:5000/health
 curl -X POST http://127.0.0.1:5000/vehicle/spawn
 ```
 
-## 命令行体验仿真（local\_runner，不接前端思考题 / 提交）
+## 命令行体验仿真
 
 纯体验仿真客户端：**先确保 relay 服务已启动**，再通过命令行运行任意实验，
-用 pygame 窗口实时渲染 relay 推送的画面（相机 / 语义 / 车顶俯瞰 / 包围框），
 实验跑完自动把结果写入 `experiment_params/output/`。全程不依赖 `carla` 模块，
-`pip install requests pygame` 即可。
 
 ```bash
 cd server/
